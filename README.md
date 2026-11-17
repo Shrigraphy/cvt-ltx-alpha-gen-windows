@@ -182,12 +182,13 @@ With Multiply by Input Alpha on, a tight mask also cuts the hair at the mask's e
 grow the mask a little (ErodeDilate), or turn Multiply off and let the guide do the
 work.
 
-**Someone in front of the subject.** The guide reaches a little past your mask, so
-where the subject passes behind someone, the model can matte a strip of the person in
-front. Connect a mask of that person (a second Magic Mask) to the node's **Occlusion
-Mask** input: it is taken out of the guide, and cut from the matte where it is solid.
-The soft edge between the two stays the model's. The Occlusion Mask input is on the
-node in Fusion Studio and on Resolve's Fusion page.
+**Something in front of the subject.** The **Occlusion Mask** input is for an object
+closer to the camera than your subject, in front of it: a person walking past, an arm,
+a pole. The guide reaches a little past your mask, so where that object overlaps the
+subject, the model can matte a strip of it. Connect a mask of the object in front (a
+second Magic Mask) to the Occlusion Mask input: it is taken out of the guide, and cut
+from the matte where it is solid. The soft edge between the two stays the model's. The
+input is on the node in Fusion Studio and on Resolve's Fusion page.
 
 **Small or distant subjects.** **Crop Scale** (Speed and Quality) scales the crop up
 2x or 3x for the model and the matte back down, for more detail on edges, hands and
@@ -240,7 +241,7 @@ edges carry the subject's smooth colour, with their shape coming from the matte.
 | Multiply by Input Alpha | Trims the matte to the input alpha. Instant. On by default. |
 | Guide With Alpha | The input alpha steers the model to that subject. On for new nodes. Needs Process. |
 | Guide Grow | How far the guide reaches past your mask, in pixels at HD (default 20), so hair outside a tight mask is still matted. Lower it when the subject is next to someone else. Needs Process. |
-| Occlusion Mask (input) | A mask of something in front of the subject: taken out of the guide and cut from the matte where it is solid. |
+| Occlusion Mask (input) | A mask of an object closer to the camera, in front of the subject: taken out of the guide and cut from the matte where it is solid. |
 | Crop Margin | Extra pixels of context around the alpha's area (default 64). Raise it if the matte is cut off in a straight line at the crop edge. Needs Process. |
 
 **Cache**
