@@ -11,9 +11,9 @@ port, not made or endorsed by Lightricks or Blackmagic Design.
 
 ## Download
 
-### [Download the installer: LTXAlphaGen-1.49.pkg](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/download/v1.49/LTXAlphaGen-1.49.pkg)
+### [Download the installer: LTXAlphaGen-1.58.pkg](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/download/v1.58/LTXAlphaGen-1.58.pkg)
 
-### [Download the guide (PDF)](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/download/v1.49/LTX_Alpha_Gen_Guide.pdf)
+### [Download the guide (PDF)](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/download/v1.58/LTX_Alpha_Gen_Guide.pdf)
 
 These links download the files straight away. You won't find the installer in the list of code files above: GitHub keeps it on the [Releases page](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/latest), under **Assets**. The installer is only the plugin, and you also need to [download the models](#setup-download-the-models).
 
@@ -31,10 +31,12 @@ These links download the files straight away. You won't find the installer in th
 - **Tested with Resolve Studio and Fusion Studio.** It has not yet been tested in the
   free version of Resolve. Magic Mask is Studio-only, but any roto or garbage matte
   works for [Guided ROI](#choosing-the-subject-guided-roi).
-- **128 GB of RAM recommended; not recommended on 64 GB or less.** The model alone
-  holds about 41 GB of the GPU's memory, however small the clip, and on a 64 GB Mac
-  macOS leaves little more than that. One M1 Max with 64 GB ran it in Fusion Studio
-  with nothing else open; an M2 Max with 64 GB could not load the model.
+- **64 GB of RAM or more.** With 128 GB it runs the full model. On a 64 GB Mac it
+  uses a lighter version of the model (16-bit without its sound part) and still runs
+  HD in 73-frame chunks ([Weights](#the-controls)). Tested on an M5 Max with 128 GB and an
+  M1 Max with 64 GB. Macs with less memory haven't been tested: 8-bit weights need
+  about 20-23 GB for 33 HD frames, so they would need a smaller picture or a Guided
+  ROI crop.
 - **It takes time.** Expect several minutes for a short HD clip on a fast Mac
   ([measured speeds](#size-and-speed)). The GPU stays busy, so playback is slow
   while a job runs.
@@ -103,7 +105,7 @@ to bring them back.
 ### Disk space
 
 Every Mac downloads the same files, about 75 GB. At the end of Setup the plugin
-times the model's core maths in two number formats. If fp16 is at least 1.2x faster
+times the model's core maths in two number formats. If fp16 is at least 1.3x faster
 than bf16 on your Mac, it also makes an fp16 copy of the 42 GB main model and uses
 that, so older chips run faster.
 
@@ -193,7 +195,8 @@ None of these except Process needs reprocessing.
 | Control | What it does |
 |---|---|
 | First Frame, Last Frame | Resolve only: process just these frames, to try a short section first. 0 means from the start or to the end. Resolve's yellow render range bars don't limit Process; in Fusion Studio they do, so it doesn't have these. |
-| Chunk Size | **Auto** (default; leave it there), **Half (73)** or **Quarter (33)** frames per model run. Auto picks the longest that fits your memory: up to 145 frames for small pictures, 73 at HD. Shorter chunks need less memory, but join at more seams. |
+| Chunk Size | **Auto** (default; leave it there), **Half (73)** or **Quarter (33)** frames per model run. Auto picks the longest that fits your Mac's memory: up to 145 frames for small pictures, 73 at HD. Shorter chunks need less memory, but join at more seams. |
+| Weights | How the model is held in memory. **Auto** (default; leave it there) uses **16-bit**, the reference quality, when the clip fits your Mac's memory. If it doesn't, Auto uses 16-bit without the model's sound part (about 13 GB less; edges can come out a little harder on motion-blurred or soft pictures), and if that doesn't fit either, **8-bit** (less than half the memory of 16-bit, close to it in quality, but about 40% slower on M1 Macs). Auto decides from your Mac's size, not from what happens to be free, so a shot comes out the same each time. 8-bit mattes are kept apart from 16-bit ones in the cache. |
 | Merge | How chunks join where they overlap. **Flow Warp** (default) lines up moving edges with optical flow while dissolving, so they slide instead of doubling. **Dissolve** is a plain cross-dissolve; try it if Flow Warp ever smears an edge. |
 | Seams | The frames where the last Process joined two chunks. Check moving edges there with Output on Matte. |
 | Frame Hold | For fast motion (a running leg, a whip pan). **2x** or **4x** repeat each frame so the model sees less motion per step, for sharper edges and a more solid core, but processing takes about 2x or 4x as long. Leave it **Off** for most shots and try 2x on a final shot with fast motion. 4x is rarely worth it. |
@@ -266,8 +269,9 @@ whole shot at once.
 
 Two limits decide what a Mac can process in one chunk:
 
-- **Memory.** About 41 GB however small the clip, plus about 0.1 GB per megapixel per
-  frame: about 45 GB for 33 HD frames, 53 GB for 73.
+- **Memory.** With the full 16-bit model, about 41 GB however small the clip, and
+  about 44 GB for 33 HD frames, 51 GB for 73. Without the model's sound part about
+  33 GB and 39 GB, and in 8-bit about 23 GB and 35 GB ([Weights](#the-controls)).
 - **Chunk size.** macOS's GPU framework refuses the model's largest arrays above about
   170 megapixel-frames per chunk, however much memory is free. That makes 73 frames the
   practical maximum at HD.
@@ -277,19 +281,27 @@ or use Guided ROI. UHD only fits for very short clips, about 17 frames.
 
 | Mac | Job | Time |
 |---|---|---|
+| M5 Max, 128 GB | 30 HD frames in Resolve: 16-bit, 8-bit | about 4, 3.7 min |
 | M5 Max, 128 GB | 176 HD frames in Resolve, 3 chunks | about 31 min |
 | M5 Max, 128 GB | 176 frames with a 512×576 Guided ROI crop in Fusion Studio, 2 chunks | about 4.3 min |
 | M5 Max, 128 GB | 63 HD frames with Frame Hold Off, 2x, 4x | about 9, 17, 35 min |
-| M1 Max, 64 GB | 33 HD frames in Fusion Studio | about 32 min |
+| M1 Max, 64 GB | 32 HD frames (Auto: 16-bit without the sound part) | about 30 min |
+| M1 Max, 64 GB | 81 HD frames in 73-frame chunks, the same | about 86 min per chunk |
+| M1 Max, 64 GB | 32 HD frames in 8-bit | about 43 min |
 
-64 GB Macs are not recommended. If you try one anyway, use Fusion Studio with nothing
-else open: it leaves about 45-49 GB for the model, against about 39 GB in Resolve.
+On a 64 GB Mac, close other apps before Process. Auto plans on the Mac's size, less
+about 8 GB for Resolve and macOS. If too much else is open, the memory check stops
+and asks you to close apps, instead of letting the Mac swap to disk.
 
 ## Known limits
 
-- **Repeat runs can differ slightly.** The first chunk of a job repeats exactly, but
-  later chunks can differ a little between runs, mostly at the edges. The cause isn't
-  known.
+- **The matte follows the exact pixels.** The same frames give the same matte, but the
+  model is very sensitive: a host can hand over slightly different pixels of the same
+  clip (Resolve and Fusion Studio decode a .mov differently, and a decode can change
+  between sessions), and the model then draws a slightly different set of strands. Both
+  are valid, but for mattes that repeat exactly, feed the node an image sequence (EXR or
+  DPX) rather than a movie file. The log shows a fingerprint of the frames each job
+  received, so two renders can be compared.
 - **Seams.** Long clips are made in chunks, and the model may pick a slightly different
   subject in each. Check the frames listed under Seams.
 

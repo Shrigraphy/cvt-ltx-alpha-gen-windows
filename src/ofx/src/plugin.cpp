@@ -103,6 +103,13 @@ const char* const kSimulations[] = {"none", "oom", "crash", "hang"};
 // A new param name, as setups store the index; the old param stays hidden and ignored.
 const char* const kChunkSizeNames[] = {"Auto", "Half (73)", "Quarter (33)"};
 constexpr int kChunkSizeChoices = 3;
+// cvt1.53: Weights. Auto: 16-bit when the job fits (cvt1.57: planMemoryGB) at any chunk size the Chunk Size
+// setting allows, else 8-bit. cvt1.56: 16-bit is the full model; Auto tries it, then 16-bit without
+// the audio branch (about 14 GB less, edges a little harder on soft pictures), then 8-bit. 8-bit (int8 weights, worker/ltxag_worker/int8.py) needs less memory
+// (vram_estimate.h) and is about 2% slower at HD. Its mattes have their own cache entries; Auto shares the 16-bit
+// ones whichever it ran. Setups store the index.
+const char* const kWeightsNames[] = {"Auto", "16-bit", "8-bit"};
+constexpr int kWeightsChoices = 3, kWeightsAuto = 0, kWeights8 = 2;
 const char* const kLegacyChunkSizeNames[] = {"Auto", "Full (145)", "Half (73)", "Quarter (33)"};
 // Merge (decision 62): how overlapping chunks are joined.
 // cvt1.19: "Dissolve" (was "Smooth"); the index is what setups store, so saved comps keep it.
@@ -174,6 +181,7 @@ constexpr const char* kPMerge = "mergeMode";
 constexpr const char* kPFrameHold = "frameHoldMode";  // cvt1.26: Off, 2x, 4x
 constexpr const char* kPLegacyFrameHold = "frameHold";  // before cvt1.26: hidden, ignored
 constexpr const char* kPSkipMemCheck = "skipMemoryCheck";  // cvt1.27
+constexpr const char* kPWeights = "weightsMode";  // cvt1.53: Auto, 16-bit, 8-bit
 constexpr const char* kPFirstFrame = "processFirstFrame";  // cvt1.35, Resolve only
 constexpr const char* kPLastFrame = "processLastFrame";    // cvt1.35, Resolve only
 // [ROI]
@@ -579,6 +587,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
     src_ = fetchClip(kOfxImageEffectSimpleSourceClipName);
     dst_ = fetchClip(kOfxImageEffectOutputClipName);
     chunkSize_ = fetchChoiceParam(kPChunkSize);
+    weights_ = fetchChoiceParam(kPWeights);  // cvt1.53
     frameHold_ = fetchChoiceParam(kPFrameHold);
     merge_ = fetchChoiceParam(kPMerge);
     roiMargin_ = fetchIntParam(kPRoiMargin);
@@ -1423,7 +1432,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
     const SetupState st = setupState();
     const bool closed = gateClosed();
     for (const char* p : {kPColourMode, kPOutput, kPPostMultiply, kPBlackClip, kPWhiteClip, kPRefresh, kPProcess, kPShowMarker, kPPurgeNode, kPPrecision, kPUnload,
-                          kPHeadroom, kPSaveDefault, kPChunkSize, kPMerge, kPSkipMemCheck, kPFirstFrame, kPLastFrame,
+                          kPHeadroom, kPSaveDefault, kPChunkSize, kPWeights, kPMerge, kPSkipMemCheck, kPFirstFrame, kPLastFrame,
                           kPRoiMargin, kPRoiMask, kPRoiLimit}) {
       try {
         getParam(p)->setEnabled(!closed);
@@ -1517,7 +1526,9 @@ class AlphaGenEffect : public OFX::ImageEffect {
   std::string paramSignature(const RoiState* roiOverride = nullptr, const OFX::Image* img = nullptr) {
     int prec = 0;
     precision_->getValue(prec);
-    std::string sig = std::string("v1|cs=") + colourKey() + "|prec=" + effectivePrecision(prec) +
+    // cvt1.53: 8-bit has its own entries; Auto and 16-bit keep the 16-bit key (so caches carry over).
+    std::string sig = std::string("v1|cs=") + colourKey() + "|prec=" +
+                      (weightsMode() == kWeights8 ? std::string("int8") : effectivePrecision(prec)) +
                       "|model=" + (useDummy() ? kDummyVersion : kModelVersion);
     // Decisions 74/75; Off = the old key. Auto: one key part per threshold version.
     const int hold = frameHold();
@@ -1632,24 +1643,70 @@ class AlphaGenEffect : public OFX::ImageEffect {
     return std::atof(jsonField(info, "vram_gb").c_str());
   }
 
+  // cvt1.57: the memory Auto (Weights and Chunk Size) plans with. On Apple Silicon it is this Mac's
+  // GPU working set less 5% and kPlanHostGB for the host and the system, never the free memory at
+  // Process: the two Autos change the matte (full or video-only model, chunk joins), and a 64 GB Mac
+  // chose the full model with 46.6 GB free and video-only with 42.1, so one shot came out two ways.
+  // The memory check (preflight) still compares the job with what is free now.
+  static constexpr double kPlanHostGB = 8.0;
+  double planMemoryGB(const VramInfo& v, double head) {
+    if (kMps) return v.totalGB * 0.95 - kPlanHostGB;
+    unsigned pid = 0;
+    return v.freeGB + residentWorkerGB(pid) - head;
+  }
+
   // Decision 61: Auto takes the longest chunk size whose estimated need fits the available
   // memory, else the smallest. Without NVML it takes Full. The overlap goes with the size.
   // With a Frame Hold (74) the model frames of a chunk are what counts.
-  int chooseChunkSize(int mode, bool fp8, int w, int h, int frames, bool resident, double head, int hold) {
+  int chooseChunkSize(int mode, bool fp8, int w, int h, int frames, bool resident, double head, int hold,
+                      Weights wts = Weights::Full16) {
     if (mode > 0) return std::min(mode, kChunkSizes - 1);  // cvt1.29: 1 Half, 2 Quarter (size index)
     const VramInfo v = queryVram();
     if (!v.ok) return 0;
-    unsigned pid = 0;
-    const double available = v.freeGB + residentWorkerGB(pid) - head;
+    const double available = planMemoryGB(v, head);  // cvt1.57: this Mac's size, not the free memory
     for (int s = 0; s < kChunkSizes; ++s) {
       const VramNeed n =
-          estimateVramNeed(fp8, w, h, heldModelFrames(std::min(heldChunkLen(s, hold), frames), hold), resident, memoryFit(fp8 ? 1 : 0));
-      LOGI("chunk size auto: %d frames/chunk needs %.1f GB, available %.1f GB%s", kSizeLen[s], n.gb, available,
+          estimateVramNeed(fp8, w, h, heldModelFrames(std::min(heldChunkLen(s, hold), frames), hold), resident,
+                           memoryFit(fp8 ? 1 : 0), wts);
+      LOGI("chunk size auto: %s %d frames/chunk needs %.1f GB, plan %.1f GB%s", weightsLabel(wts),
+           kSizeLen[s], n.gb, available,
            n.overMpsLimit ? "; over the Apple Silicon size limit" : "");
       if (n.overMpsLimit) continue;  // cvt1.28: MPS can't run it at all
       if (n.gb <= available) return s;
     }
     return kChunkSizes - 1;
+  }
+
+  // cvt1.53: whether these weights fit at a chunk size the Chunk Size setting allows (Auto: any).
+  // Unknown memory counts as fitting (as chooseChunkSize takes Full then). cvt1.56: any Weights.
+  bool fitsWeights(Weights wts, int mode, int w, int h, int frames, bool resident, double head, int hold) {
+    const VramInfo v = queryVram();
+    if (!v.ok) return true;
+    const double available = planMemoryGB(v, head);  // cvt1.57
+    const int first = mode > 0 ? std::min(mode, kChunkSizes - 1) : 0;
+    const int last = mode > 0 ? first : kChunkSizes - 1;
+    for (int s = first; s <= last; ++s) {
+      const VramNeed n = estimateVramNeed(false, w, h, heldModelFrames(std::min(heldChunkLen(s, hold), frames), hold),
+                                          resident, memoryFit(0), wts);
+      if (!n.overMpsLimit && n.gb <= available) return true;
+    }
+    return false;
+  }
+
+  int weightsMode() {
+    int m = 0;
+    weights_->getValue(m);
+    return std::min(std::max(m, 0), kWeightsChoices - 1);
+  }
+
+  // cvt1.53: the precision the worker runs: int8 for 8-bit weights (on the bf16 file), else bf16
+  // (or Setup's fp16 copy). cvt1.56: "-video" for 16-bit without the audio branch (Auto's middle step).
+  std::string jobPrecision(int prec) {
+    if (jobWeights_ == Weights::Int8) return "int8";
+    return effectivePrecision(prec) + (jobWeights_ == Weights::VideoOnly16 ? "-video" : "");
+  }
+  static const char* weightsLabel(Weights w) {
+    return w == Weights::Int8 ? "8-bit" : w == Weights::VideoOnly16 ? "16-bit video-only" : "16-bit";
   }
 
   // modelFrames: of the largest chunk, holds included (74/75).
@@ -1661,7 +1718,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
     headroom_->getValue(head);
     unload_->getValue(unload);
     simNeed_->getValue(simNeed);
-    const VramNeed est = estimateVramNeed(prec == 1, w, h, modelFrames, !unload, memoryFit(prec));
+    const VramNeed est = estimateVramNeed(prec == 1, w, h, modelFrames, !unload, memoryFit(prec), jobWeights_);
     const double need = simNeed > 0.0 ? simNeed : est.gb;
     const VramInfo v = queryVram();
     unsigned workerPid = 0;
@@ -1669,7 +1726,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
     const double available = v.freeGB + reusable - head;
     LOGI("preflight: %s %dx%d largest chunk %d model frames -> model %dx%dx%d, need %.1f GB%s; free %.1f + resident "
          "%.1f - reserve %.1f = %.1f GB available (nvml %s)",
-         effectivePrecision(prec).c_str(), w, h, modelFrames, est.modelW, est.modelH, est.modelFrames, need,
+         jobPrecision(prec).c_str(), w, h, modelFrames, est.modelW, est.modelH, est.modelFrames, need,
          simNeed > 0.0 ? " (simulated)" : "", v.freeGB, reusable, head, available, v.ok ? "ok" : "unavailable");
     bool warned = false;
     // cvt1.28: too big for Apple Silicon at this size, whatever the memory (MPS tensor limit).
@@ -1687,7 +1744,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
     skipMemCheck_->getValue(skip);
     if (v.ok && need > available && (!useDummy() || simNeed > 0.0) && skip) {
       // cvt1.27: Skip Memory Check: the user runs it anyway (to find out whether a smaller Mac
-      // copes, e.g. a 64 GB M1 Max: the model alone is 42 GB). The job's peak memory goes to
+      // copes, e.g. a 64 GB M1 Max; since cvt1.50 only about 26 GB of the 42 GB file is loaded). The job's peak memory goes to
       // logs/vram_stats.csv as usual, flagged as warned.
       LOGW("preflight: needs %.1f GB, %.1f GB available; Skip Memory Check is on, processing anyway",
            need, available);
@@ -1711,7 +1768,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
       LOGW("preflight: GPU %.1f GB total, %.1f free; host holds %.1f GB, LTX worker %.1f GB, other apps %.1f GB (%s)",
            v.totalGB, v.freeGB, flame, reusable, others, list.c_str());
       std::string msg = "This clip may not fit in GPU memory.\n\nEstimated need: about " + fmtGB(need) +
-                        " GB (" + effectivePrecision(prec) + ", " + std::to_string(est.modelW) + "x" +
+                        " GB (" + jobPrecision(prec) + ", " + std::to_string(est.modelW) + "x" +
                         std::to_string(est.modelH) + ", " + std::to_string(est.modelFrames) +
                         " frames per chunk).\nAvailable: " + fmtGB(available) + " GB = " + fmtGB(v.freeGB) +
                         " GB free";
@@ -1731,9 +1788,11 @@ class AlphaGenEffect : public OFX::ImageEffect {
         // messages, which threw and ended Process. On a Mac an over-committed run swaps the
         // whole machine instead of failing cleanly, so without an answer it stops here.
         error("Too large for this Mac's memory: needs about " + fmtGB(need) + " GB, " + fmtGB(available) +
-              " GB available. Scale the clip down before this node (UHD to HD), give it an alpha "
-              "ROI, or choose a smaller Chunk Size. Or tick Skip Memory Check (Speed and Quality) "
-              "to try anyway.");
+              " GB available. Close other apps and Process again (Auto plans for this Mac's memory, "  // cvt1.57
+              "not for what is free now), scale the clip down before this node (UHD to HD), give it an "
+              "alpha ROI, or choose a smaller Chunk Size" +
+              std::string(jobWeights_ == Weights::Int8 ? "" : ", or set Weights to 8-bit (less memory)") +  // cvt1.53
+              ". Or tick Skip Memory Check (Speed and Quality) to try anyway.");
         return false;
       }
       warned = true;
@@ -1856,7 +1915,20 @@ class AlphaGenEffect : public OFX::ImageEffect {
     // staging; memory is checked before that against the worst case (4x), which bounds any plan.
     const int hold = frameHold();
     const int planHold = hold == 0 ? kAutoMaxHold : hold;
-    const int sizeIdx = chooseChunkSize(chunkMode, prec == 1, roi.box.w, roi.box.h, n, !unload, head, planHold);
+    // cvt1.53: Weights. cvt1.56: Auto takes the full model when it fits at any allowed chunk size,
+    // else 16-bit without the audio branch, else 8-bit (always video-only).
+    const int wmode = weightsMode();
+    jobWeights_ = Weights::Full16;
+    if (kMps && wmode == kWeights8) {
+      jobWeights_ = Weights::Int8;
+    } else if (kMps && wmode == kWeightsAuto) {
+      for (Weights w : {Weights::Full16, Weights::VideoOnly16, Weights::Int8}) {
+        jobWeights_ = w;
+        if (fitsWeights(w, chunkMode, roi.box.w, roi.box.h, n, !unload, head, planHold)) break;
+      }
+    }
+    LOGI("process: weights %s -> %s", kWeightsNames[wmode], weightsLabel(jobWeights_));
+    const int sizeIdx = chooseChunkSize(chunkMode, prec == 1, roi.box.w, roi.box.h, n, !unload, head, planHold, jobWeights_);
     const int overlap = hold == 0 ? kSizeOverlap[sizeIdx] : heldOverlap(sizeIdx, hold);
     std::vector<Chunk> chunks;
     int modelFrames = std::min(kSizeLen[sizeIdx], heldModelFrames(n, planHold));
@@ -2024,7 +2096,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
     }
     js
        << ",\"seconds\":" << seconds << ",\"simulate\":" << jsonStr(kSimulations[sim])
-       << ",\"precision\":" << jsonStr(effectivePrecision(prec)) << ",\"vram\":" << vramJson
+       << ",\"precision\":" << jsonStr(jobPrecision(prec)) << ",\"vram\":" << vramJson
        << ",\"flame_pid\":" << getpid()
        << ",\"title\":" << jsonStr("LTX Alpha Gen - " + std::to_string(n) + " frames") << "}";
     const std::string manifest = stagingDir() + "/ltxag_job_" + jobId + ".json";
@@ -2358,6 +2430,8 @@ class AlphaGenEffect : public OFX::ImageEffect {
   OFX::StringParam* status_;
   OFX::BooleanParam* showMarker_;
   OFX::ChoiceParam* precision_;
+  OFX::ChoiceParam* weights_;  // cvt1.53
+  Weights jobWeights_ = Weights::Full16;  // cvt1.53 (was jobInt8_), cvt1.56: set in process()
   OFX::BooleanParam* unload_;
   OFX::DoubleParam* headroom_;
   OFX::BooleanParam* accept_;
@@ -2697,7 +2771,7 @@ class AlphaGenFactory : public OFX::PluginFactoryHelper<AlphaGenFactory> {
       place(*p, gChunk);
     }
     auto* csize = labelled(desc.defineChoiceParam(kPChunkSize), "Chunk Size",
-                           "Frames per model run. Auto: the longest that fits the free memory and the "
+                           "Frames per model run. Auto: the longest that fits this Mac's memory and the "
                            "Mac's size limit: up to 145 frames for small pictures (a Guided ROI "
                            "crop, 720p), 73 at HD. Smaller chunks need less memory but have more seams, "
                            "and the model may pick a different main object in each chunk.");
@@ -2706,6 +2780,20 @@ class AlphaGenFactory : public OFX::PluginFactoryHelper<AlphaGenFactory> {
     csize->setEvaluateOnChange(false);
     still(csize);
     place(*csize, gChunk);
+    // cvt1.53: Weights (Apple Silicon only).
+    auto* weights = labelled(desc.defineChoiceParam(kPWeights), "Weights",
+                             "How the model is held in memory. Auto: 16-bit when the clip fits this Mac's "
+                             "memory; else 16-bit without the model's sound part (about 13 GB less, edges a "
+                             "little harder on motion-blurred or soft pictures); else 8-bit. 16-bit: reference "
+                             "quality. 8-bit: least memory (16-23 GB less than 16-bit at HD), for Macs with "
+                             "less memory; edges like the middle step, about 40% slower on M1 Macs. 8-bit "
+                             "mattes are kept apart from 16-bit ones. Needs Process.");  // cvt1.56
+    for (const char* c : kWeightsNames) weights->appendOption(c);
+    weights->setDefault(kWeightsAuto);
+    weights->setEvaluateOnChange(false);
+    if (!kMps) weights->setIsSecret(true);
+    still(weights);
+    place(*weights, gChunk);
     // cvt1.29: the old Chunk Size (with Full), so comps saved with it still load.
     auto* oldSize = labelled(desc.defineChoiceParam(kPLegacyChunkSize), "Chunk Size (old)", "");
     for (const char* c : kLegacyChunkSizeNames) oldSize->appendOption(c);

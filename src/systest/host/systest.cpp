@@ -956,6 +956,33 @@ void testMacFp8(Ctx& c) {
   CHECK(j.state == "none" && contains(j.message, "fp8 is not available on Apple Silicon"), "fp8 refused: " + j.message);
 }
 
+// cvt1.53: Weights 8-bit runs the worker as int8 and keeps its mattes apart; Auto picks 16-bit when
+// the job fits (this Mac's free memory, a tiny clip).
+void testWeights(Ctx& c) {
+  if (!c.mac) throw Skip("Weights is Apple Silicon only");
+  c.readyConfig();
+  Scene sc{320, 240, 9, AlphaMode::Opaque};
+  auto in = c.node(sc);
+  c.readyConfig(in.get());
+  REQUIRE(in->getInt("weightsMode") == 0, "Weights starts on Auto");
+  in->setInt("weightsMode", 2);
+  Job j = runJob(*in, c.jobTimeout());
+  CHECK(j.state == "done", "8-bit job: " + j.state + " " + j.message);
+  const std::string log = readFile(home() + "/.cache/ltx-alphagen/logs/ltx-alphagen.log");
+  CHECK(contains(log, "process: weights 8-bit -> 8-bit"), "the log names 8-bit weights");
+  CHECK(contains(log, "precision=int8"), "the worker ran as int8");
+  const Rendered r8 = in->render(0);
+  CHECK(r8.status == kOfxStatOK, "the 8-bit matte renders");
+  in->setInt("weightsMode", 0);
+  const Rendered ra = in->render(0);
+  CHECK(ra.status != kOfxStatOK, "Auto finds no 16-bit matte yet (8-bit mattes are kept apart)");
+  Job k = runJob(*in, c.jobTimeout());
+  CHECK(k.state == "done", "Auto job: " + k.state + " " + k.message);
+  const std::string log2 = readFile(home() + "/.cache/ltx-alphagen/logs/ltx-alphagen.log");
+  CHECK(contains(log2, "process: weights Auto -> 16-bit"), "Auto picked 16-bit for a clip that fits");
+  checkClean(*in);
+}
+
 // cvt1.42: Download stops with a clear message, keeps the token and starts nothing.
 void testNoAppleTools(Ctx& c) {
   if (!c.mac) throw Skip("the Command Line Tools are a Mac requirement");
@@ -1194,6 +1221,7 @@ int main(int argc, char** argv) {
       {"not_processed", testNotProcessed}, {"process_chunks_merge_purge", testProcess},
       {"roi", testRoi},               {"cancel", testCancel},            {"failures", testFailures},
       {"too_large", testTooLarge},    {"memory_warning", testMemoryWarning}, {"save_default", testDefaults}, {"mac_fp8_refused", testMacFp8},
+      {"weights", testWeights},
       {"no_apple_tools", testNoAppleTools}, {"file_permissions", testFilePermissions}, {"collect_logs", testCollectLogs}};
   const std::vector<Test> full = {
       {"describe", testDescribe}, {"release_gate", testFullGate}, {"real_matte", testRealMatte},

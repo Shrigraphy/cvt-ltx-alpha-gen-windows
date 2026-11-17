@@ -323,3 +323,66 @@ about Flame, Linux or NVIDIA, that part does not apply here.
   control, which only picks files.
 - cvt1.49: a Model Folder that was set up and has since been deleted is no longer offered from the saved settings: the field goes
   back to `~/LTX-2.5`. A folder on a drive that isn't mounted stays, since the drive may come back.
+- cvt1.50: the transformer is loaded without its audio branch. LTX-2.5 makes a sound track beside the picture
+  (audio blocks and audio-video cross-attention, about 12 GB of the 42 GB model), and the matte never used it.
+  The worker now builds upstream's video-only model, never reads the audio weights from disk, and gives each
+  chunk no audio latent (injection 8). `LTXAG_KEEP_AUDIO=1` keeps the full model for A/B tests. The memory
+  estimate is unchanged until jobs on this version are measured.
+- cvt1.51: the memory check now matches cvt1.50, which no longer loads the audio part of the model. Every Apple
+  Silicon estimate is 11.3 GB lower, the smallest saving measured on the M5 Max (an HD 73-frame chunk peaked at
+  38.9 GB, down from 50.2 GB; it is now estimated at 42.0 GB, was 53.3). A 64 GB Mac, which gives the GPU about
+  52 GB, can now take HD shots in 73-frame chunks. Not measured on a 64 GB Mac or an M1 yet.
+- cvt1.52: corrects cvt1.51, which under-estimated one chunk. Its first HD 73-frame chunk peaked at 43.1 GB against an
+  estimate of 41.9 GB (the others took 38.3-39.1 GB). Every Apple Silicon estimate is now 7.0 GB lower than in cvt1.49
+  (not 11.3 GB), the smallest saving measured on any chunk, and never below 44.1 GB, the highest peak measured without
+  audio (43.1 GB) plus the margin, which looks like the model load. An HD 73-frame chunk is estimated at 46.3 GB, which still
+  fits the roughly 52 GB a 64 GB Mac gives the GPU. cvt1.51 was never committed.
+- cvt1.53: new Weights menu in Speed and Quality: Auto (default), 16-bit, 8-bit. 8-bit holds the transformer's
+  big layers (attention and feed-forward in every block) in 8 bits, one scale per row, converted while the
+  16-bit file loads, with the alpha-gen LoRA merged in first (`worker/ltxag_worker/int8.py`, worker precision
+  `int8`). In the test tool on the M5 Max it needed 12 GB less (HD 33 frames: 30.9 vs 42.9 GB), was about 2%
+  slower at HD, and its mattes were within 0.06% of 16-bit on average. Auto uses 16-bit when the clip fits at any chunk size
+  Chunk Size allows, else 8-bit; 8-bit mattes have their own cache entries (Auto shares the 16-bit ones). The
+  memory estimate is 11.5 GB lower for 8-bit. On an M1 it runs with bf16 activations (no fp16), slower there;
+  not tested on an M1 or a smaller Mac. Comps saved before load on Auto, which is 16-bit on any Mac where they ran.
+- cvt1.54: the 8-bit memory estimate is 8.5 GB below 16-bit, not 11.5 GB. cvt1.53's first 8-bit job in Resolve (HD,
+  65 frames in one chunk, 498 s) peaked at 34.3 GB against an estimate of 33.1 GB: in Resolve 8-bit saves about 9 GB,
+  not the 12 GB the test tool measured. HD 73-frame chunks are now estimated at 37.8 GB in 8-bit (46.3 in 16-bit).
+  The hints say about 8 GB less. cvt1.53 was never committed.
+- cvt1.55: the reference frames are encoded in overlapping 640 px tiles (upstream's tiled encode, 128 px blended,
+  still fp32). In one piece the encode was the job's peak: at HD 65 frames it took 24.4 GB and left the GPU cache at
+  38.6 GB, the same in 16-bit and 8-bit, so 8-bit saved nothing at the peak. Tiled it takes 7.5 GB. Two runs give
+  identical mattes; against the one-piece encode 0.12% of pixels differ by more than 0.1, and they match the test
+  shape as well. The MPS cache is also handed back before each decode, and the job log shows each chunk's peak per
+  phase (encode, load and step 1, steps, decode). The memory estimate for the M5 and newer is refit from eight runs
+  (peak reserved): 16-bit HD 73 frames 36.4 GB (was 43.1), estimated 38.9; 8-bit HD 73 frames 33.6 GB, estimated
+  34.9; 8-bit HD 33 frames 19.2 GB, estimated 23.4. `LTXAG_ENCODE_TILE=0` encodes in one piece, for tests only.
+  cvt1.54 was never committed.
+- cvt1.56: 16-bit runs the full model again (with its audio branch, as cvt1.49). On a motion-blurred HD shot the
+  video-only model (cvt1.50-1.55) drew about half as many partly transparent edge pixels: harder edges on the arm,
+  paddle and water where the picture is soft. Rendered four ways on the same 61 frames, the full model with the
+  one-piece encode matched the cvt1.49 matte (0.08% of pixels off by more than 0.1); the tiled encode only gives a
+  slightly different sample at the same softness, so it stays. Auto now tries the full model, then 16-bit without the
+  audio branch (precision "bf16-video"/"fp16-video", the old 1.55 path, about 13 GB less), then 8-bit (still
+  video-only). The explicit 16-bit choice is the full model. New M5 fit for it, from peak reserved memory: 768x432 17f
+  40.6, HD 33f 42.7, HD 65f 48.4, HD 73f 49.9 GB; need = max(40.6, 36.8 + 0.086 x Mpx x frames) + 1 GB. So a 64 GB
+  Mac (about 41 GB free) gets the video-only 16-bit at HD, which keeps the M1's speed: 8-bit on an M1 Max took 2595 s
+  against 1834 s for the same 33-frame HD chunk. `LTXAG_VIDEO_ONLY=1` forces video-only 16-bit, for A/B tests
+  (replaces `LTXAG_KEEP_AUDIO`). Cached 16-bit mattes made by cvt1.50-1.55 keep their key: clear them to remake.
+- cvt1.57: the full model (16-bit) encodes its reference frames in one piece again, as cvt1.49, so its mattes match
+  the public release; the tiled encode only gave a different sample (on a curly-hair shot 1.3% of pixels moved by
+  more than 0.1, the same softness). It saved nothing there: the full model's peak is its load (768x432 17f 40.4,
+  HD 33f 42.7, HD 73f 49.9 GB in one piece, the same as tiled). 16-bit video-only and 8-bit still tile, where the
+  encode was the peak. And Auto (Weights and Chunk Size) now plans with this Mac's size, not the free memory at
+  Process: the GPU working set less 5% and 8 GB for the host and system. A 64 GB M1 Max chose the full model with
+  46.6 GB free and video-only with 42.1, so one shot came out two ways; it now always gets 16-bit video-only (plan
+  41.2 GB: HD 73-frame chunks fit at 38.9), and an M5 Max with 128 GB always the full model. The memory check still
+  compares the job with what is free now, and its message says to close other apps. M1 Max, full model, HD 32
+  frames on cvt1.56: 43.0 GB peak against 43.7 estimated, 1999 s (video-only 1834 s, 8-bit 2595 s).
+- cvt1.58: each chunk's log line now carries a fingerprint of the frames the host staged, before any colour
+  conversion: a hash of the chunk and one per frame (6 hex digits), the mean RGB and range, and whether the values
+  sit on 8-, 10- or 12-bit levels. The model gives the same matte for the same frames (a node re-rendered on
+  2026-11-17 matched its 2026-11-07 matte to 0.001% of pixels; started at frame 1006 or 1029, 0.000%), yet two
+  LTX nodes with identical settings fed by the same Loader in one Fusion comp disagree by 1.8% of pixels, every
+  time. Re-rendering both and comparing the fingerprints shows which frames differ. About 0.3 s per HD 30-frame
+  chunk. No change to the mattes.
