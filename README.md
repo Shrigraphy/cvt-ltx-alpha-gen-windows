@@ -11,9 +11,9 @@ port, not made or endorsed by Lightricks or Blackmagic Design.
 
 ## Download
 
-### [Download the installer: LTXAlphaGen-1.58.pkg](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/download/v1.58/LTXAlphaGen-1.58.pkg)
+### [Download the installer: LTXAlphaGen-1.65.pkg](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/download/v1.65/LTXAlphaGen-1.65.pkg)
 
-### [Download the guide (PDF)](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/download/v1.58/LTX_Alpha_Gen_Guide.pdf)
+### [Download the guide (PDF)](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/download/v1.65/LTX_Alpha_Gen_Guide.pdf)
 
 These links download the files straight away. You won't find the installer in the list of code files above: GitHub keeps it on the [Releases page](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/latest), under **Assets**. The installer is only the plugin, and you also need to [download the models](#setup-download-the-models).
 
@@ -148,32 +148,55 @@ LTX Alpha Gen, then take the matte to the original branch.
 ## Choosing the subject: Guided ROI
 
 There is no text prompt: the model picks the main subject of what it sees. To choose
-the subject, give the picture coming in an alpha, such as a loose Magic Mask, roto or
-garbage matte. It does two things:
+the subject, give the picture coming in an alpha, such as a Magic Mask, roto or even
+a rough shape. It does three things:
 
+- **Which subject the model mattes.** With **Guide With Alpha** (on for new nodes), the
+  alpha steers the model to that subject: other people and objects drop out, and the
+  model still draws the edges, hair included. The alpha is grown and softened first
+  (**Guide Grow**, 20 px at HD), so a rough mask is enough. In a test with four people
+  in a street, a mask on one of them cut everything else from the matte, and a rough
+  moving rectangle on a man the model had ignored gave a clean full-body matte.
 - **Where the model looks.** The model only sees a crop around the area the alpha
-  covers over the whole clip, plus a margin. That is much faster, and better for small
-  subjects. A mask that sweeps across half the frame makes a big crop, and the model
-  may keep more than you want inside it.
+  covers over the whole clip, plus a margin. That is much faster. A mask that sweeps
+  across half the frame makes a big crop.
 - **What you keep.** **Multiply by Input Alpha** (on by default) trims the matte to
   your mask, instantly.
 
-The setup that works best keeps the real picture inside the crop, so the model makes
-the edges itself:
+The alpha has to come with the untouched picture: the plugin uses the picture coming
+in as the model's input, so don't cut it out (premultiply) before the node.
 
 ```
-Loader1 ───────────────────────────────────┐ Background
-   └→ MagicMask1 → ErodeDilate → Foreground ┴→ MatteControl1 → LTX Alpha Gen
+Loader1 ─────────────────────── Background ┐
+   └→ MagicMask1 ─────────────── Foreground ┴→ MatteControl1 → LTX Alpha Gen
 ```
 
-1. Magic Mask the subject. An **ErodeDilate** grown a few pixels puts the mask's edge
-   just outside the subject, so LTX's edge decides the outline.
+1. Magic Mask the subject. A quick, rough mask is fine for the guide.
 2. **MatteControl:** Background = the original picture, Foreground = the mask.
    Matte: Combine **Combine Alpha**, Combine Op **Copy**, **Post-Multiply Image off**.
+   (Check with the viewer's colour channels: the whole picture should be there, not
+   black around the subject.)
 3. Press Process. **Model Crop** shows the crop size, for example "Crop 1280x1024".
 
-A small subject in a UHD shot can be processed at full resolution this way, without
-the Resize, as long as the crop is no bigger than about an HD frame in area.
+With Multiply by Input Alpha on, a tight mask also cuts the hair at the mask's edge:
+grow the mask a little (ErodeDilate), or turn Multiply off and let the guide do the
+work.
+
+**Someone in front of the subject.** The guide reaches a little past your mask, so
+where the subject passes behind someone, the model can matte a strip of the person in
+front. Connect a mask of that person (a second Magic Mask) to the node's **Occlusion
+Mask** input: it is taken out of the guide, and cut from the matte where it is solid.
+The soft edge between the two stays the model's. The Occlusion Mask input is on the
+node in Fusion Studio and on Resolve's Fusion page.
+
+**Small or distant subjects.** **Crop Scale** (Speed and Quality) scales the crop up
+2x or 3x for the model and the matte back down, for more detail on edges, hands and
+gaps between people. As a rule of thumb at HD: 3x for a subject under about 300 px
+tall, 2x up to about 500 px, off above that. It costs about as much as an HD job, and
+a crop that would end up bigger than HD is scaled less.
+
+A small subject in a UHD shot can be processed at full resolution with Guided ROI,
+without a Resize, as long as the crop is no bigger than about an HD frame in area.
 
 ## The controls
 
@@ -183,12 +206,18 @@ the Resize, as long as the crop is no bigger than about an HD frame in area.
 |---|---|
 | Process | Makes mattes for every frame of the comp, or the render range in Fusion Studio. |
 | Status | What the node is doing, or why it stopped. |
-| Output | **Source + Matte Alpha** (default): the picture with the matte in its alpha. **Matte**: the matte in RGB and alpha. **Overlay**: the picture with the matte in magenta, to check it. |
+| Output | **Source + Matte Alpha** (default): the picture with the matte in its alpha. **Matte**: the matte in RGB and alpha. **Overlay**: the picture with the matte in magenta, to check it. **Pixel Spread + Matte Alpha**: like Source + Matte Alpha, but the contaminated edge pixels (where the old background shows through hair, motion blur and soft edges) get the subject's own colour, spread out from its solid part, so no colour or detail of the old background comes along into a new one. |
 | Post-Multiply Image | On (default): the picture is multiplied by the matte, ready for a Merge. Off: the picture untouched. |
+| Pixel Spread Erode | For Pixel Spread only: how many pixels the solid part of the matte is eroded before its colour is spread out (default 1). Raise it if the solid part's own edge still carries a rim of the old background. |
+| Pixel Spread Fade | For Pixel Spread only: how many pixels the original picture takes to fade into the spread colour, further in (default 2). The fade stays inside the solid part, so it brings no background back. |
+| Pixel Spread Blur | For Pixel Spread only: blurs the picture where the spread colour and the original meet (default 0, off), blending only the subject's own pixels. Useful on soft or motion-blurred subjects. |
 | Alpha Black Clip | Matte values at or below it become 0 (default 0.005). This clears the faint haze the model leaves in the background. |
 | Alpha White Clip | Matte values at or above it become 1 (default 0.995), so the inside of the subject is solid. Soft edges stay soft. |
 
 None of these except Process needs reprocessing.
+
+Pixel Spread has no detail of its own in soft edges: thin hair strands and motion-blurred
+edges carry the subject's smooth colour, with their shape coming from the matte.
 
 **Speed and Quality** (the defaults are fine)
 
@@ -196,6 +225,7 @@ None of these except Process needs reprocessing.
 |---|---|
 | First Frame, Last Frame | Resolve only: process just these frames, to try a short section first. 0 means from the start or to the end. Resolve's yellow render range bars don't limit Process; in Fusion Studio they do, so it doesn't have these. |
 | Chunk Size | **Auto** (default; leave it there), **Half (73)** or **Quarter (33)** frames per model run. Auto picks the longest that fits your Mac's memory: up to 145 frames for small pictures, 73 at HD. Shorter chunks need less memory, but join at more seams. |
+| Crop Scale | With an input alpha: **Off** (default), **2x** or **3x**. Scales the crop up for the model and the matte back down, for more edge detail on small or distant subjects ([Guided ROI](#choosing-the-subject-guided-roi)). A crop that would end up bigger than HD is scaled less. Needs Process. |
 | Weights | How the model is held in memory. **Auto** (default; leave it there) uses **16-bit**, the reference quality, when the clip fits your Mac's memory. If it doesn't, Auto uses 16-bit without the model's sound part (about 13 GB less; edges can come out a little harder on motion-blurred or soft pictures), and if that doesn't fit either, **8-bit** (less than half the memory of 16-bit, close to it in quality, but about 40% slower on M1 Macs). Auto decides from your Mac's size, not from what happens to be free, so a shot comes out the same each time. 8-bit mattes are kept apart from 16-bit ones in the cache. |
 | Merge | How chunks join where they overlap. **Flow Warp** (default) lines up moving edges with optical flow while dissolving, so they slide instead of doubling. **Dissolve** is a plain cross-dissolve; try it if Flow Warp ever smears an edge. |
 | Seams | The frames where the last Process joined two chunks. Check moving edges there with Output on Matte. |
@@ -208,7 +238,9 @@ None of these except Process needs reprocessing.
 |---|---|
 | Model Crop | The crop the model saw at the last Process. |
 | Multiply by Input Alpha | Trims the matte to the input alpha. Instant. On by default. |
-| Black Out Outside Alpha | Blacks out the picture outside the alpha before the model sees it, so it can't pick anything else. The edges then follow your mask. Needs Process. |
+| Guide With Alpha | The input alpha steers the model to that subject. On for new nodes. Needs Process. |
+| Guide Grow | How far the guide reaches past your mask, in pixels at HD (default 20), so hair outside a tight mask is still matted. Lower it when the subject is next to someone else. Needs Process. |
+| Occlusion Mask (input) | A mask of something in front of the subject: taken out of the guide and cut from the matte where it is solid. |
 | Crop Margin | Extra pixels of context around the alpha's area (default 64). Raise it if the matte is cut off in a straight line at the crop edge. Needs Process. |
 
 **Cache**
@@ -285,6 +317,7 @@ or use Guided ROI. UHD only fits for very short clips, about 17 frames.
 | M5 Max, 128 GB | 176 HD frames in Resolve, 3 chunks | about 31 min |
 | M5 Max, 128 GB | 176 frames with a 512×576 Guided ROI crop in Fusion Studio, 2 chunks | about 4.3 min |
 | M5 Max, 128 GB | 63 HD frames with Frame Hold Off, 2x, 4x | about 9, 17, 35 min |
+| M5 Max, 128 GB | 69 frames with a 512×608 crop in Fusion Studio, Crop Scale Off, 2x | about 1.2, 5.5 min |
 | M1 Max, 64 GB | 32 HD frames (Auto: 16-bit without the sound part) | about 30 min |
 | M1 Max, 64 GB | 81 HD frames in 73-frame chunks, the same | about 86 min per chunk |
 | M1 Max, 64 GB | 32 HD frames in 8-bit | about 43 min |
@@ -304,6 +337,14 @@ and asks you to close apps, instead of letting the Mac swap to disk.
   received, so two renders can be compared.
 - **Seams.** Long clips are made in chunks, and the model may pick a slightly different
   subject in each. Check the frames listed under Seams.
+- **A tight guide next to a big object.** When the subject touches a large solid object
+  the guide leaves out (a toy right beside a robot, for example), the model can invent
+  shapes there for a few frames, such as a shifted copy of the subject. For subjects in
+  a cluster like that, turn Guide With Alpha off and keep Multiply by Input Alpha on, or
+  loosen the mask.
+- **Matte haze shows in Pixel Spread.** Faint matte haze around the subject (a few
+  percent) carries the subject's colour in Pixel Spread. Raise Alpha Black Clip a
+  little, or guide the model with a mask.
 
 ## If something goes wrong
 

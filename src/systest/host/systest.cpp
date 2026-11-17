@@ -426,7 +426,12 @@ void testDescribe(Ctx& c) {
   CHECK(d.props.getStr(kOfxImageEffectPropSupportedContexts, 1).empty(), "no second context");
   CHECK(d.clips.count(kOfxImageEffectSimpleSourceClipName) && d.clips.count(kOfxImageEffectOutputClipName),
         "Source and Output clips");
-  CHECK(d.clips.size() == 2, "exactly two clips (no ROI input, decision 63)");
+  // cvt1.64: plus the optional Occlusion mask input (the ROI still comes from the Source alpha, decision 63).
+  CHECK(d.clips.size() == 3 && d.clips.count("Occlusion"), "Source, Output and the optional Occlusion mask");
+  if (d.clips.count("Occlusion")) {
+    CHECK(d.clips["Occlusion"]->props.getInt(kOfxImageClipPropOptional) == 1, "Occlusion is optional");
+    CHECK(d.clips["Occlusion"]->props.getInt(kOfxImageClipPropIsMask) == 1, "Occlusion is a mask input");
+  }
   for (const auto& n : kExpectedParams) CHECK(d.params.byName.count(n), "param " + n + " defined");
   // Release builds hide the Prototype params but still define them (saved setups load).
   for (const char* n : {"simSeconds", "simulate", "simNeedGB", "pythonPath", "enforceGate", "autoRefresh", "useDummy"}) {
@@ -800,6 +805,19 @@ void testRoi(Ctx& c) {
              },
              4e-3f, "Black Out Outside ROI");
   checkClean(*in);
+  // cvt1.65: Crop Scale 2x: the crop is staged twice as large and the matte averaged back down,
+  // so it matches the unscaled one (the dummy matte is the picture's luma; the Catmull-Rom scale
+  // and the 2x2 mean leave a small error at the disc's sharp edge).
+  in->setBool("roiMaskOutside", false);
+  in->setInt("cropScale", 1);
+  checkFailed(in->render(8), "changed Crop Scale");
+  j = runJob(*in, c.jobTimeout());
+  REQUIRE(j.state == "done", "Crop Scale job " + j.state + " " + j.message);
+  CHECK(in->getString("roiInfo") == "Crop " + std::to_string(bw) + "x" + std::to_string(bh) + " at 2x",
+        "ROI info with Crop Scale: " + in->getString("roiInfo"));
+  checkMatte(in->render(8), sc, 8, [&](const float* s, int x, int y) { return inBox(x, y) ? luma(s) : 0.0f; },
+             0.06f, "Crop Scale 2x");
+  in->setInt("cropScale", 0);
   // An empty alpha is an error, not a crop of nothing.
   Scene empty{320, 240, 9, AlphaMode::Empty};
   auto e = c.node(empty);

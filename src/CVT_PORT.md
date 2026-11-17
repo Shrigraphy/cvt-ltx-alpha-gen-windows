@@ -386,3 +386,52 @@ about Flame, Linux or NVIDIA, that part does not apply here.
   LTX nodes with identical settings fed by the same Loader in one Fusion comp disagree by 1.8% of pixels, every
   time. Re-rendering both and comparing the fingerprints shows which frames differ. About 0.3 s per HD 30-frame
   chunk. No change to the mattes.
+- cvt1.59: new Output choice "Decontaminated + Matte Alpha" (added last, so saved setups keep theirs) and
+  "Decontaminate Erode (px)" (default 64). Contaminated edge pixels, where the background shows through hair,
+  motion blur and soft edges, get the subject's own colour: Blur-Fusion foreground estimation (Forte and Pitie,
+  ICIP 2021; radii 90 then 6 px at 1080p), clamped to the solid core's local mean +- 1.5 std, blended towards the
+  core colour pushed outwards (push-pull pyramid) where the matte is thin. Only pixels with matte between 0.02
+  and 0.98 and within the erode width of background change; the matte and the background stay as they are.
+  Render-time (ofx/src/decontam.cpp, own code; ideas from a GPL ComfyUI node, no code copied), in the colour space
+  the host delivers, about 0.25 s per HD frame. Post-Multiply Image applies to it as to Source.
+- cvt1.60: Decontaminated + Matte Alpha is now a strict edge extend: the solid core (matte >= 0.98), eroded by
+  "Alpha Erode" (renamed from "Decontaminate Erode"; now the erode of the core, default 2 px, param id alphaErode),
+  has its colour pushed outwards and that replaces every other subject pixel. 1.59's Blur-Fusion estimate kept
+  per-pixel source detail, so background lettering showed in the soft edge of an out-of-focus face (sh010), and
+  filled matte that reached past the visible edge with bright skin (a cut-out outline). Faint matte haze more
+  than 256 px (at 1080p) from the subject keeps the source, as does pure background. Thin hair strands now carry
+  the hair's smooth colour, not their own highlights. About 0.05 s per HD frame (was 0.25 s).
+- cvt1.61: "Edge Blend" (px, default 4, param id edgeBlend) under Alpha Erode: in Decontaminated + Matte Alpha,
+  the original picture fades into the extended edge colour over that many pixels, going in from where Alpha
+  Erode stops. The fade stays inside the solid part of the matte (>= 0.98), so no background detail returns;
+  the colour is now taken from beyond the blend. 0 is a hard switch (cvt1.60 had a fixed 1.5 px step).
+- cvt1.62: Edge Blend is shown as "Edge Fade" (same param id edgeBlend, so 1.61 setups keep their value), and new
+  "Edge Blur" (px, default 0 = off, param id edgeBlur): a blur of the decontaminated picture, the last step before
+  the matte, about a Gaussian of that size (three box passes). It averages only the subject's pixels (matte >= 0.02
+  near the subject), so the old background next to the edge never comes back, and it applies where the extended
+  colour does, tapering off with the fade so the picture further in stays sharp. About 0.14 s per HD frame at 4 px.
+- cvt1.63: "Guide With Alpha" (Guided ROI group, param id roiGuide; on for new nodes, off in setups saved before,
+  needs Process). The input alpha (Magic Mask, roto or a rough shape) is thresholded at 0.5, grown 20 px and
+  feathered (about a Gaussian of 10 px), both scaled with the frame height from 1080, and staged as a 4th channel
+  (frame file channels 4). The worker passes it as the IC-LoRA guide's conditioning_attention_mask (already in
+  ltx_pipelines; the ComfyUI Comfy Pro node's "v13" uses the same with SAM3), so LTX mattes that subject only and
+  still draws its edges. Tested on sh090 (33 HD frames): a mask on one woman cut the matte outside her by 99% with
+  hair as good; a rough moving box on a man LTX had ignored gave a clean full-body matte. Guided mattes get their
+  own cache key (ROI k bit 1). Also: test_roi now fails on a failed check.
+- cvt1.64: "Guide Grow (px)" (param id roiGuideGrow, default 20 at HD, 0-100, needs Process; non-default values
+  get their own cache key) and an optional "Occlusion Mask" input (clip "Occlusion", a mask clip in the Filter context
+  as openfx-misc's Mask inputs; not on Resolve's Color page). With Guide With Alpha, the occlusion mask is taken out of the
+  guide at Process (ROI k bit 2), and at render it cuts the matte where its own mask is solid (smooth 0.5-0.98),
+  so the soft edge between the subject and what is in front stays LTX's. For a subject passing behind someone (sh090:
+  guided by the cart man's Magic Mask, LTX also matted a strip of the old man in front). "Black Out Outside Alpha"
+  is hidden (Guide With Alpha does it better; still works in setups that have it on). Defaults halved: Alpha Erode
+  1 (was 2), Edge Fade 2 (was 4).
+- cvt1.65: "Crop Scale" (Off / 2x / 3x, Speed and Quality, param id cropScale, needs Process): with an input alpha,
+  the crop is scaled up by that whole factor (Catmull-Rom, the guide channel too) before the model sees it, and
+  job.py averages each matte back down over k x k blocks before pasting it into the frame. Memory, chunk size,
+  the 6K check and the job size use the scaled size; a crop that would end up bigger than about HD (1920x1088
+  pixels) is scaled less, logged. The scale is in the ROI state (bits 3-4) and so in the cache key. Tested
+  outside the node on sh470 (two people about 270 px tall, a 640x360 crop at 3x): the people separate, a
+  ponytail and hands survive, the curly hair is tighter, same time as an HD job. Labels renamed: Output
+  "Pixel Spread + Matte Alpha" (was Decontaminated + Matte Alpha), "Pixel Spread Erode / Fade / Blur" (were
+  Alpha Erode, Edge Fade, Edge Blur); param ids unchanged.

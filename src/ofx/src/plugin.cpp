@@ -48,6 +48,7 @@
 #include "platform.h"
 #include "process.h"
 #include "roi.h"
+#include "decontam.h"  // cvt1.59
 #include "transport.h"
 #include "user_config.h"
 #include "vram_estimate.h"
@@ -109,6 +110,8 @@ constexpr int kChunkSizeChoices = 3;
 // (vram_estimate.h) and is about 2% slower at HD. Its mattes have their own cache entries; Auto shares the 16-bit
 // ones whichever it ran. Setups store the index.
 const char* const kWeightsNames[] = {"Auto", "16-bit", "8-bit"};
+// cvt1.65: Crop Scale: the input-alpha crop scaled up 2x or 3x for the model (small subjects).
+const char* const kCropScaleNames[] = {"Off", "2x", "3x"};
 constexpr int kWeightsChoices = 3, kWeightsAuto = 0, kWeights8 = 2;
 const char* const kLegacyChunkSizeNames[] = {"Auto", "Full (145)", "Half (73)", "Quarter (33)"};
 // Merge (decision 62): how overlapping chunks are joined.
@@ -127,8 +130,11 @@ constexpr int kAutoMaxHold = 4;
 // Output (CVT Resolve port): what the RGB channels carry; the alpha is always the matte.
 // Source: the picture untouched, ready for a Merge or a mask in Fusion. Matte: the matte in RGB
 // too (to view it, or for the Edit and Color pages). Overlay: the upstream magenta preview.
-const char* const kOutputNames[] = {"Source + Matte Alpha", "Matte", "Overlay"};
-constexpr int kOutSource = 0, kOutMatte = 1, kOutOverlay = 2;
+// cvt1.59: Decontaminated + Matte Alpha: the picture with its contaminated edge pixels (the
+// background mixed into soft, semi-transparent edges) replaced by the subject's own colour
+// (decontam.h). Added last so saved setups keep their choice.
+const char* const kOutputNames[] = {"Source + Matte Alpha", "Matte", "Overlay", "Pixel Spread + Matte Alpha"};  // cvt1.65: was Decontaminated + Matte Alpha
+constexpr int kOutSource = 0, kOutMatte = 1, kOutOverlay = 2, kOutDecontam = 3;
 
 // Params. Column (group) in brackets; see upstream-notes/ofx.md (layout, decisions 37/52).
 // [Alpha Gen]
@@ -144,6 +150,9 @@ constexpr const char* kPPostMultiply = "postMultiply";   // CVT port (cvt1.10)
 constexpr const char* kPSeams = "seamsInfo";             // CVT port (cvt1.20)
 constexpr const char* kPBlackClip = "alphaBlackClip";     // CVT port (cvt1.26)
 constexpr const char* kPWhiteClip = "alphaWhiteClip";     // CVT port (cvt1.26)
+constexpr const char* kPErode = "alphaErode";  // CVT port (cvt1.60; cvt1.59 test builds used "decontamErode", 64 = a band width)
+constexpr const char* kPEdgeBlend = "edgeBlend";  // CVT port (cvt1.61; shown as Edge Fade since cvt1.62)
+constexpr const char* kPEdgeBlur = "edgeBlur";    // CVT port (cvt1.62)
 constexpr const char* kWebsiteUrl = "https://creativevideotips.com";
 constexpr const char* kModelPageUrl = "https://huggingface.co/Lightricks/LTX-2.5";
 constexpr const char* kTokenPageUrl = "https://huggingface.co/settings/tokens";
@@ -182,11 +191,16 @@ constexpr const char* kPFrameHold = "frameHoldMode";  // cvt1.26: Off, 2x, 4x
 constexpr const char* kPLegacyFrameHold = "frameHold";  // before cvt1.26: hidden, ignored
 constexpr const char* kPSkipMemCheck = "skipMemoryCheck";  // cvt1.27
 constexpr const char* kPWeights = "weightsMode";  // cvt1.53: Auto, 16-bit, 8-bit
+constexpr const char* kPCropScale = "cropScale";  // cvt1.65: Off, 2x, 3x
 constexpr const char* kPFirstFrame = "processFirstFrame";  // cvt1.35, Resolve only
 constexpr const char* kPLastFrame = "processLastFrame";    // cvt1.35, Resolve only
 // [ROI]
 constexpr const char* kPRoiMargin = "roiMargin";
 constexpr const char* kPRoiMask = "roiMaskOutside";
+constexpr const char* kPRoiGuide = "roiGuide";  // cvt1.63
+constexpr const char* kPRoiGuideGrow = "roiGuideGrow";  // cvt1.64
+constexpr const char* kExcludeClip = "Occlusion";  // cvt1.64: optional mask input, shown as Occlusion Mask
+constexpr int kGuideGrowDefault = 20;
 constexpr const char* kPRoiLimit = "roiLimit";
 constexpr const char* kPRoiInfo = "roiInfo";
 // [Cache] — per user, except Purge Cache (this node).
@@ -488,13 +502,22 @@ struct RoiState {
   bool active = false;   // the source alpha was a matte: the model saw `box` only
   RoiBox box{0, 0, 0, 0};
   bool mask = false;     // Black Out Outside ROI was on
+  bool guide = false;    // cvt1.63: Guide With Alpha was on (the alpha steered the model)
+  bool exclude = false;  // cvt1.64: the Occlusion Mask was taken out of the guide
+  int scale = 1;         // cvt1.65: Crop Scale used (1, 2 or 3)
   std::string settings;  // roiSettings() at that time; a mismatch means "reprocess"
 };
+
+// The flags number of the ROI state: bit 0 Black Out, bit 1 guide (cvt1.63), bit 2 Occlusion Mask
+// (cvt1.64), bits 3-4 Crop Scale - 1 (cvt1.65). It is also part of the cache key.
+int roiBits(const RoiState& r) {
+  return int(r.mask) | (int(r.guide) << 1) | (int(r.exclude) << 2) | ((std::max(1, std::min(3, r.scale)) - 1) << 3);
+}
 
 std::string formatRoiState(const RoiState& r) {
   char b[160];
   std::snprintf(b, sizeof b, "%d,%d,%d,%d,%d,%d;%s", int(r.active), r.box.x, r.box.y, r.box.w,
-                r.box.h, int(r.mask), r.settings.c_str());
+                r.box.h, roiBits(r), r.settings.c_str());
   return b;
 }
 
@@ -506,7 +529,10 @@ RoiState parseRoiState(const std::string& v) {
                   &k, set) == 7) {
     r.valid = true;
     r.active = a != 0;
-    r.mask = k != 0;
+    r.mask = (k & 1) != 0;
+    r.guide = (k & 2) != 0;  // cvt1.63
+    r.exclude = (k & 4) != 0;  // cvt1.64
+    r.scale = 1 + ((k >> 3) & 3);  // cvt1.65
     r.settings = set;
   }
   return r;
@@ -579,6 +605,32 @@ void placeOnCanvas(const OFX::Image& img, const Canvas& c, std::vector<float>& b
   }
 }
 
+// cvt1.64: a mask image (the Occlusion Mask input) on the canvas: c.w * c.h floats, rows top-down, 0
+// outside the image. Alpha-only images give their value, RGBA their alpha, RGB their luma.
+void maskOnCanvas(const OFX::Image& img, const Canvas& c, std::vector<float>& out) {
+  out.assign(size_t(c.w) * c.h, 0.0f);
+  if (img.getPixelDepth() != OFX::eBitDepthFloat) return;
+  const OfxRectI b = img.getBounds();
+  const int comps = componentsOf(img);
+  const int x0 = std::max(b.x1, c.x), x1 = std::min(b.x2, c.x + c.w);
+  if (x0 >= x1 || comps < 1) return;
+  for (int y = std::max(b.y1, c.y); y < std::min(b.y2, c.y + c.h); ++y) {
+    const auto* p = static_cast<const float*>(img.getPixelAddress(x0, y));
+    float* q = out.data() + size_t(c.y + c.h - 1 - y) * c.w + (x0 - c.x);
+    for (int x = x0; x < x1; ++x, p += comps, ++q) {
+      const float v = comps == 1 ? p[0] : comps == 4 ? p[3] : 0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2];
+      *q = std::min(1.0f, std::max(0.0f, v));
+    }
+  }
+}
+
+// cvt1.64: how much of the matte the Occlusion Mask cuts: nothing below 0.5, all at 0.98 and above, so the
+// soft edge between the subject and the excluded thing stays LTX's.
+inline float excludeCut(float e) {
+  const float t = std::min(1.0f, std::max(0.0f, (e - 0.5f) / 0.48f));
+  return t * t * (3.0f - 2.0f * t);
+}
+
 std::atomic<unsigned> gJobSeq{0};
 
 class AlphaGenEffect : public OFX::ImageEffect {
@@ -586,12 +638,20 @@ class AlphaGenEffect : public OFX::ImageEffect {
   explicit AlphaGenEffect(OfxImageEffectHandle handle) : ImageEffect(handle) {
     src_ = fetchClip(kOfxImageEffectSimpleSourceClipName);
     dst_ = fetchClip(kOfxImageEffectOutputClipName);
+    try {
+      exclude_ = fetchClip(kExcludeClip);  // cvt1.64
+    } catch (const std::exception&) {
+      exclude_ = nullptr;
+    }
     chunkSize_ = fetchChoiceParam(kPChunkSize);
     weights_ = fetchChoiceParam(kPWeights);  // cvt1.53
+    cropScale_ = fetchChoiceParam(kPCropScale);  // cvt1.65
     frameHold_ = fetchChoiceParam(kPFrameHold);
     merge_ = fetchChoiceParam(kPMerge);
     roiMargin_ = fetchIntParam(kPRoiMargin);
     roiMask_ = fetchBooleanParam(kPRoiMask);
+    roiGuide_ = fetchBooleanParam(kPRoiGuide);
+    roiGuideGrow_ = fetchIntParam(kPRoiGuideGrow);
     roiLimit_ = fetchBooleanParam(kPRoiLimit);
     roiState_ = fetchStringParam(kPRoiState);
     canvasState_ = fetchStringParam(kPCanvas);
@@ -605,6 +665,9 @@ class AlphaGenEffect : public OFX::ImageEffect {
     firstFrame_ = fetchIntParam(kPFirstFrame);
     lastFrame_ = fetchIntParam(kPLastFrame);
     whiteClip_ = fetchDoubleParam(kPWhiteClip);
+    erode_ = fetchIntParam(kPErode);
+    edgeBlend_ = fetchIntParam(kPEdgeBlend);
+    edgeBlur_ = fetchIntParam(kPEdgeBlur);
     seams_ = fetchStringParam(kPSeams);
     legacyColour_ = fetchChoiceParam(kPColour);
     status_ = fetchStringParam(kPStatus);
@@ -659,6 +722,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
         // delivers them, which the model expects display-referred).
         const bool resolve = hostIsBlackmagic();
         colourMode_->setValue(resolve ? kColourBypass : kColourAuto);
+        roiGuide_->setValue(true);  // cvt1.63: new nodes guide the model with the input alpha
         initialized_->setValue(true);
         LOGI("new node: defaults [%s] precision=%s headroom=%.1f unload=%d input colour=%s",
              d.source.c_str(), kPrecisions[d.precision], d.headroomGB, int(d.unload),
@@ -714,7 +778,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
     prefs.setClipComponents(*dst_, OFX::ePixelComponentRGBA);
     // cvt1.10: tell the host whether RGB is premultiplied by the alpha (Post-Multiply Image, or
     // Output = Matte, whose RGB is the matte), so Fusion's Merge treats the edges right.
-    const bool premult = outputMode() == kOutMatte || (outputMode() == kOutSource && postMultiply());
+    const bool premult = outputMode() == kOutMatte || (picturedOutput() && postMultiply());
     prefs.setOutputPremultiplication(premult ? OFX::eImagePreMultiplied : OFX::eImageUnPreMultiplied);
     LOGD("getClipPreferences: output RGBA, %s", premult ? "premultiplied" : "straight");
   }
@@ -728,7 +792,13 @@ class AlphaGenEffect : public OFX::ImageEffect {
   int outputMode() {
     int m = kOutSource;
     output_->getValue(m);
-    return (m == kOutMatte || m == kOutOverlay) ? m : kOutSource;
+    return (m == kOutMatte || m == kOutOverlay || m == kOutDecontam) ? m : kOutSource;
+  }
+
+  // cvt1.59: the outputs that carry the picture (straight or premultiplied) with the matte alpha.
+  bool picturedOutput() {
+    const int m = outputMode();
+    return m == kOutSource || m == kOutDecontam;
   }
 
   int colourMode() {
@@ -775,7 +845,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
   std::string outputColourspace() {
     LogScope scope(nodeId_);
     if (!src_->isConnected()) return "";
-    if (outputMode() == kOutSource) return "";  // CVT Resolve port: the source picture, as delivered
+    if (picturedOutput()) return "";  // CVT Resolve port: the source picture, as delivered (cvt1.59: or decontaminated)
     if (outputMode() == kOutMatte || colourMode() == kColourBypass) {  // the image output carries the matte: a data colourspace
       const std::string style = getPropertySet().propGetString(kOfxImageEffectPropColourManagementStyle, false);
       return style == kOfxImageEffectColourManagementOCIO ? "Matte" : "";  // "Matte": Flame's aces2.0 config
@@ -991,6 +1061,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
           halfToFloat(half.data(), matte.data(), matte.size());
           applyAlphaClip(matte);  // cvt1.26, before the ROI limit so the input alpha's edges stay soft
           applyRoiLimit(*src, cv, matte);
+          applyExclude(args.time, cv, matte);  // cvt1.64
         } else if (!pictureChanged && isPending(root, key)) {
           message = "Processing: this frame is not ready yet.";
           caption = "MAKING MAGIC";  // cvt1.21 (was PROCESSING)
@@ -1060,7 +1131,39 @@ class AlphaGenEffect : public OFX::ImageEffect {
     const bool displayOut = colourMode() == kColourAuto && deliveredColourspace() == kAutoColourspace;
     // cvt1.10: Post-Multiply Image, only with a real matte (a marker or the not-processed white
     // matte leaves the picture as it is).
-    const bool premultiply = outMode == kOutSource && realMatte && postMultiply();
+    const bool pictured = outMode == kOutSource || outMode == kOutDecontam;
+    const bool premultiply = pictured && realMatte && postMultiply();
+    // cvt1.59: Decontaminated: the whole canvas's picture, decontaminated with the matte, in the
+    // matte's layout (top-down). Computed per render (no tiles; about 0.05 s at HD since cvt1.60).
+    std::vector<float> decon;
+    if (outMode == kOutDecontam && realMatte && !loud && rgbFromSource) {
+      std::vector<float> pic(size_t(w) * h * 3, 0.0f);
+      for (int r = 0; r < h; ++r) {
+        const int y = cv.y + (h - 1 - r);
+        if (y < sb.y1 || y >= sb.y2) continue;
+        for (int col = 0; col < w; ++col) {
+          const int x = cv.x + col;
+          if (x < sb.x1 || x >= sb.x2) continue;
+          const float* sp = static_cast<const float*>(src->getPixelAddress(x, y));
+          if (sp)
+            for (int c = 0; c < 3; ++c) pic[(size_t(r) * w + col) * 3 + c] = sp[c];
+        }
+      }
+      DecontamSettings ds;
+      int erode = 1;
+      erode_->getValue(erode);
+      ds.erodeWidth = float(erode);
+      int blend = 2, blur = 0;
+      edgeBlend_->getValue(blend);
+      edgeBlur_->getValue(blur);
+      ds.edgeFade = float(blend);
+      ds.edgeBlur = float(blur);
+      ds.scale = float(h) / 1080.0f;
+      const auto t0 = std::chrono::steady_clock::now();
+      decontaminate(pic.data(), matte.data(), w, h, ds, decon);
+      LOGD("render t=%g: decontaminated %dx%d, alpha erode %d, edge fade %d, edge blur %d px, in %.0f ms", args.time, w, h, erode, blend, blur,
+           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
     for (int y = std::max(win.y1, db.y1); y < std::min(win.y2, db.y2); ++y) {
       auto* px = static_cast<float*>(out->getPixelAddress(std::max(win.x1, db.x1), y));
       const int row = (h - 1) - (y - cv.y);  // OFX is bottom-up, the matte top-down
@@ -1078,8 +1181,9 @@ class AlphaGenEffect : public OFX::ImageEffect {
                               : nullptr;
         if (loud || outMode == kOutMatte) {
           px[0] = px[1] = px[2] = v;  // the marker, grey on black; Matte: the matte on both outputs
-        } else if (outMode == kOutSource) {
+        } else if (pictured) {
           const float k = premultiply ? v : 1.0f;  // cvt1.10: Post-Multiply Image
+          if (!decon.empty() && inside) sp = &decon[(size_t(row) * w + col) * 3];  // cvt1.59
           for (int c = 0; c < 3; ++c) px[c] = sp ? sp[c] * k : 0.0f;  // the picture (times the matte)
         } else {
           static const float kBlack[3] = {0.0f, 0.0f, 0.0f};
@@ -1143,6 +1247,21 @@ class AlphaGenEffect : public OFX::ImageEffect {
     std::vector<float> buf;  // the source on the canvas: alpha 0 outside the image (cvt1.07)
     placeOnCanvas(src, cv, buf);
     for (size_t i = 0; i < matte.size(); ++i) matte[i] *= std::min(1.0f, std::max(0.0f, buf[i * 4 + 3]));
+  }
+
+  // cvt1.64: the Occlusion Mask cuts the matte where its own mask is solid (render time, no reprocessing).
+  void applyExclude(double time, const Canvas& cv, std::vector<float>& matte) {
+    if (!exclude_ || !exclude_->isConnected()) return;
+    std::unique_ptr<OFX::Image> ex;
+    try {
+      ex.reset(exclude_->fetchImage(time));
+    } catch (const std::exception& e) {
+      LOGW("render: Occlusion fetchImage(%g) threw: %s", time, e.what());
+    }
+    if (!ex) return;
+    std::vector<float> m;
+    maskOnCanvas(*ex, cv, m);
+    for (size_t i = 0; i < matte.size() && i < m.size(); ++i) matte[i] *= 1.0f - excludeCut(m[i]);
   }
 
   // cvt1.20: the overlaps of neighbouring chunks in comp frames, e.g. "1019-1033, 1037-1051",
@@ -1245,6 +1364,8 @@ class AlphaGenEffect : public OFX::ImageEffect {
     int margin = 64;
     roiMargin_->getValue(margin);
     roiMask_->getValue(out.mask);
+    roiGuide_->getValue(out.guide);  // cvt1.63
+    out.exclude = out.guide && exclude_ && exclude_->isConnected();  // cvt1.64
     out.settings = roiSettings();
     out.valid = true;
     out.box = {0, 0, W, H};
@@ -1309,10 +1430,16 @@ class AlphaGenEffect : public OFX::ImageEffect {
     }
     out.active = true;
     out.box = expandRoi(scan.alpha, margin, W, H);
+    int cs = 0;  // cvt1.65: Crop Scale, stepped down so the scaled crop stays about HD at most
+    cropScale_->getValue(cs);
+    out.scale = cropScaleFor(cs + 1, out.box.w, out.box.h, kCropScaleMaxPixels);
+    if (out.scale != cs + 1)
+      LOGI("process: Crop Scale %dx would make the %dx%d crop bigger than HD; using %dx", cs + 1, out.box.w,
+           out.box.h, out.scale);
     LOGI("process: ROI from source alpha: bounds x %d-%d y %d-%d (union of %d frames), margin %d -> crop "
-         "x %d y %d %dx%d of %dx%d, black out outside %d",
+         "x %d y %d %dx%d of %dx%d, black out outside %d, guide %d (2 = with Occlusion Mask), scale %dx",
          scan.alpha.x0, scan.alpha.x1, scan.alpha.y0, scan.alpha.y1, n, margin, out.box.x,
-         out.box.y, out.box.w, out.box.h, W, H, int(out.mask));
+         out.box.y, out.box.w, out.box.h, W, H, int(out.mask), int(out.guide) + int(out.exclude), out.scale);
     return true;
   }
 
@@ -1431,9 +1558,9 @@ class AlphaGenEffect : public OFX::ImageEffect {
   void refreshSetupUi() {
     const SetupState st = setupState();
     const bool closed = gateClosed();
-    for (const char* p : {kPColourMode, kPOutput, kPPostMultiply, kPBlackClip, kPWhiteClip, kPRefresh, kPProcess, kPShowMarker, kPPurgeNode, kPPrecision, kPUnload,
-                          kPHeadroom, kPSaveDefault, kPChunkSize, kPWeights, kPMerge, kPSkipMemCheck, kPFirstFrame, kPLastFrame,
-                          kPRoiMargin, kPRoiMask, kPRoiLimit}) {
+    for (const char* p : {kPColourMode, kPOutput, kPPostMultiply, kPErode, kPEdgeBlend, kPEdgeBlur, kPBlackClip, kPWhiteClip, kPRefresh, kPProcess, kPShowMarker, kPPurgeNode, kPPrecision, kPUnload,
+                          kPHeadroom, kPSaveDefault, kPChunkSize, kPWeights, kPCropScale, kPMerge, kPSkipMemCheck, kPFirstFrame, kPLastFrame,
+                          kPRoiMargin, kPRoiMask, kPRoiGuide, kPRoiGuideGrow, kPRoiLimit}) {
       try {
         getParam(p)->setEnabled(!closed);
       } catch (const std::exception& e) {
@@ -1538,7 +1665,12 @@ class AlphaGenEffect : public OFX::ImageEffect {
       if (st.active)
         sig += "|roi=" + std::to_string(st.box.x) + "," + std::to_string(st.box.y) + "," +
                std::to_string(st.box.w) + "," + std::to_string(st.box.h) + ",k" +
-               std::to_string(int(st.mask));
+               std::to_string(roiBits(st));  // cvt1.63-1.65
+      if (st.active && st.guide) {  // cvt1.64: a non-default Guide Grow is a different matte
+        int gg = kGuideGrowDefault;
+        roiGuideGrow_->getValue(gg);
+        if (gg != kGuideGrowDefault) sig += "|gg=" + std::to_string(gg);
+      }
     } else if (img && alphaVaries(*img)) {
       sig += "|roi=unprocessed";
     }
@@ -1550,7 +1682,17 @@ class AlphaGenEffect : public OFX::ImageEffect {
     bool mask = false;
     roiMargin_->getValue(margin);
     roiMask_->getValue(mask);
-    return "m" + std::to_string(margin) + "k" + std::to_string(int(mask));
+    bool guide = false;
+    roiGuide_->getValue(guide);
+    int gg = kGuideGrowDefault;
+    roiGuideGrow_->getValue(gg);
+    // cvt1.63: "g1" only when guided, so settings saved before keep matching; cvt1.64: the grow
+    // only when not the default.
+    int cs = 0;
+    cropScale_->getValue(cs);
+    return "m" + std::to_string(margin) + "k" + std::to_string(int(mask)) + (guide ? "g1" : "") +
+           (guide && gg != kGuideGrowDefault ? "gg" + std::to_string(gg) : "") +
+           (cs > 0 ? "s" + std::to_string(cs + 1) : "");  // cvt1.65: only when scaled
   }
 
   // The saved ROI state, valid only while the ROI settings still match the ones it was made with.
@@ -1893,8 +2035,11 @@ class AlphaGenEffect : public OFX::ImageEffect {
     if (!computeRoi(first, n, canvas, roi, err)) return error(err);
     if (roi.active) stagingBase_ = 0.5;  // the ROI scan was the first half of the bar
     const bool useRoi = roi.active;
+    // cvt1.65: what the model sees: the crop, times Crop Scale.
+    const int kScale = useRoi ? roi.scale : 1;
+    const int mw = roi.box.w * kScale, mh = roi.box.h * kScale;
     // Decision 72: no 6K. Checked on what the model sees (the crop), before anything is staged.
-    if (std::max(roi.box.w, roi.box.h) >= kMaxLongSide)
+    if (std::max(mw, mh) >= kMaxLongSide)
       return error(std::string(useRoi ? "The region of interest" : "The frame") + " is " +
                    std::to_string(roi.box.w) + "x" + std::to_string(roi.box.h) +
                    ": too large for the LTX model (6K and above are not supported). Scale the clip "
@@ -1924,11 +2069,11 @@ class AlphaGenEffect : public OFX::ImageEffect {
     } else if (kMps && wmode == kWeightsAuto) {
       for (Weights w : {Weights::Full16, Weights::VideoOnly16, Weights::Int8}) {
         jobWeights_ = w;
-        if (fitsWeights(w, chunkMode, roi.box.w, roi.box.h, n, !unload, head, planHold)) break;
+        if (fitsWeights(w, chunkMode, mw, mh, n, !unload, head, planHold)) break;
       }
     }
     LOGI("process: weights %s -> %s", kWeightsNames[wmode], weightsLabel(jobWeights_));
-    const int sizeIdx = chooseChunkSize(chunkMode, prec == 1, roi.box.w, roi.box.h, n, !unload, head, planHold, jobWeights_);
+    const int sizeIdx = chooseChunkSize(chunkMode, prec == 1, mw, mh, n, !unload, head, planHold, jobWeights_);
     const int overlap = hold == 0 ? kSizeOverlap[sizeIdx] : heldOverlap(sizeIdx, hold);
     std::vector<Chunk> chunks;
     int modelFrames = std::min(kSizeLen[sizeIdx], heldModelFrames(n, planHold));
@@ -1941,7 +2086,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
          kChunkSizeNames[chunkMode], kSizeLen[sizeIdx], overlap, kFrameHoldNames[std::min(kFrameHoldChoices - 1, std::max(0, frameHoldIndex()))],
          kMergeNames[mergeMode]);
     std::string vramJson;
-    if (!preflight(modelFrames, roi.box.w, roi.box.h, vramJson)) return;
+    if (!preflight(modelFrames, mw, mh, vramJson)) return;
     const std::string sig = paramSignature(&roi);
     const std::string root = cacheRoot();
     const std::string jobId = std::to_string(getpid()) + "-" + std::to_string(gJobSeq++) + "-" +
@@ -1953,9 +2098,19 @@ class AlphaGenEffect : public OFX::ImageEffect {
 
     std::vector<std::string> keys(n);
     int w = 0, h = 0;
-    const int cw = roi.box.w, ch = roi.box.h;  // what the model sees
+    const int cw = roi.box.w, ch = roi.box.h;  // the crop; the model sees mw x mh (Crop Scale, cvt1.65)
     FrameWriter writer;
     std::vector<float> rgb, maskRow, onCanvas, thumb;
+    // cvt1.63: Guide With Alpha stages a 4th channel, the grown and feathered input alpha.
+    const bool guided = useRoi && roi.guide;
+    const size_t chans = guided ? 4 : 3;
+    std::vector<float> alphaFull, guide, rgb3, exFull, nat, up;
+    int guideGrow = kGuideGrowDefault;
+    roiGuideGrow_->getValue(guideGrow);  // cvt1.64
+    if (guided) {
+      alphaFull.resize(size_t(fullW) * fullH);
+      rgb3.resize(size_t(cw) * 3);
+    }
     std::vector<uint16_t> frame;
     std::unique_ptr<MotionAnalyzer> analyzer;  // Auto Frame Hold (75)
     if (hold == 0) analyzer.reset(new MotionAnalyzer(cw, ch));
@@ -1988,33 +2143,67 @@ class AlphaGenEffect : public OFX::ImageEffect {
         w = fullW, h = fullH;  // cvt1.07: the canvas, whatever this frame's own size
         LOGI("process: source %s depth %d on a %dx%d canvas", img->getPixelComponentsProperty().c_str(),
              int(img->getPixelDepth()), w, h);
-        if (!writer.open(input, cw, ch, n, err)) {
+        if (!writer.open(input, mw, mh, n, err, guided ? 4u : 3u)) {
           unlink(input.c_str());
           return error(err);
         }
-        rgb.resize(size_t(cw) * 3);
+        rgb.resize(size_t(cw) * chans);
         maskRow.resize(size_t(w));
-        frame.resize(size_t(cw) * ch * 3);
+        nat.resize(size_t(cw) * ch * chans);
+        frame.resize(size_t(mw) * mh * chans);
       }
       placeOnCanvas(*img, canvas, onCanvas);  // cvt1.07: frames may differ in size (Crop, Magic Mask)
       const int sc = 4;
       // Black Out Outside ROI: the source times its own alpha matte, in the source's colour space
       // (black stays near black after the colour conversion).
       const bool blackOut = useRoi && roi.mask;
+      // cvt1.63: Guide With Alpha: the whole frame's alpha, grown and feathered, as a 4th channel.
+      if (guided) {
+        for (int y = 0; y < h; ++y) roiRowAlpha(onCanvas.data() + size_t(y) * w * 4, sc, w, alphaFull.data() + size_t(y) * w);
+        const float gs = float(h) / 1080.0f;
+        guideMask(alphaFull.data(), w, h, float(guideGrow) * gs, kGuideFeather * gs, guide);
+        if (roi.exclude) {  // cvt1.64: the Occlusion Mask is taken out of the guide
+          std::unique_ptr<OFX::Image> ex;
+          try {
+            ex.reset(exclude_->fetchImage(double(first + f)));
+          } catch (const std::exception& e) {
+            LOGW("process: Occlusion fetchImage(%d) threw: %s", first + f, e.what());
+          }
+          if (ex) {
+            maskOnCanvas(*ex, canvas, exFull);
+            for (size_t i = 0; i < guide.size(); ++i) guide[i] *= 1.0f - exFull[i];
+          }
+        }
+      }
       for (int row = 0; row < ch; ++row) {
         const int srcRow = roi.box.y + row;
         const float* canvasRow = onCanvas.data() + size_t(srcRow) * w * 4;
         const float* p = canvasRow + size_t(roi.box.x) * 4;
         for (int x = 0; x < cw; ++x)
-          for (int k = 0; k < 3; ++k) rgb[size_t(x) * 3 + k] = p[size_t(x) * sc + k];
+          for (int k = 0; k < 3; ++k) rgb[size_t(x) * chans + k] = p[size_t(x) * sc + k];
+        if (guided)
+          for (int x = 0; x < cw; ++x) rgb[size_t(x) * chans + 3] = guide[size_t(srcRow) * w + roi.box.x + x];
         if (useRoi && (blackOut || analyzer)) roiRowAlpha(canvasRow, sc, w, maskRow.data());
         // Motion on the picture before Black Out, inside the ROI matte (75).
-        if (analyzer) analyzer->addRow(row, rgb.data(), useRoi ? maskRow.data() + roi.box.x : nullptr);
+        if (analyzer && !guided) analyzer->addRow(row, rgb.data(), useRoi ? maskRow.data() + roi.box.x : nullptr);
+        if (analyzer && guided) {  // the analyzer wants RGB rows
+          for (int x = 0; x < cw; ++x)
+            for (int k = 0; k < 3; ++k) rgb3[size_t(x) * 3 + k] = rgb[size_t(x) * 4 + k];
+          analyzer->addRow(row, rgb3.data(), maskRow.data() + roi.box.x);
+        }
         if (blackOut) {
           for (int x = 0; x < cw; ++x)
-            for (int k = 0; k < 3; ++k) rgb[size_t(x) * 3 + k] *= maskRow[size_t(roi.box.x + x)];
+            for (int k = 0; k < 3; ++k) rgb[size_t(x) * chans + k] *= maskRow[size_t(roi.box.x + x)];
         }
-        floatToHalf(rgb.data(), frame.data() + size_t(row) * cw * 3, rgb.size());
+        std::copy(rgb.begin(), rgb.end(), nat.begin() + size_t(row) * cw * chans);
+      }
+      if (kScale > 1) {  // cvt1.65: Crop Scale
+        upscaleInt(nat.data(), cw, ch, int(chans), kScale, up);
+        if (guided)
+          for (size_t i = 3; i < up.size(); i += 4) up[i] = std::min(1.0f, std::max(0.0f, up[i]));
+        floatToHalf(up.data(), frame.data(), up.size());
+      } else {
+        floatToHalf(nat.data(), frame.data(), nat.size());
       }
       if (analyzer) motion[f] = analyzer->endFrame();
       thumbnailOf(onCanvas.data(), w, h, thumb);  // cvt1.18: found by node, frame and thumbnail
@@ -2029,7 +2218,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
     const double sec =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     LOGI("process: staged %d frames in %.2f s (%.1f ms/frame), %.1f MB in %s", n, sec,
-         1000.0 * sec / n, double(n) * cw * ch * 6 / 1048576.0, input.c_str());
+         1000.0 * sec / n, double(n) * mw * mh * 2 * chans / 1048576.0, input.c_str());
     if (hold == 0) {
       chunks = planAutoChunks(autoHolds(motion), sizeIdx);
       std::vector<double> sorted(motion.begin() + 1, motion.end());
@@ -2054,7 +2243,8 @@ class AlphaGenEffect : public OFX::ImageEffect {
     simulate_->getValue(sim);
     std::ostringstream js;
     js << "{\"job_id\":" << jsonStr(jobId) << ",\"node_id\":" << jsonStr(nodeId_)
-       << ",\"input\":" << jsonStr(input) << ",\"width\":" << cw << ",\"height\":" << ch
+       << ",\"input\":" << jsonStr(input) << ",\"width\":" << mw << ",\"height\":" << mh
+       << ",\"crop_scale\":" << kScale  // cvt1.65: job.py averages the matte back down
        << ",\"full_width\":" << w << ",\"full_height\":" << h;
     if (useRoi)
       js << ",\"roi\":[" << roi.box.x << "," << roi.box.y << "," << roi.box.w << "," << roi.box.h << "]";
@@ -2111,7 +2301,8 @@ class AlphaGenEffect : public OFX::ImageEffect {
     setIfChanged(roiState_, formatRoiState(roi));  // render keys on it from now on
     setIfChanged(seams_, seamsText(chunks, first));  // cvt1.20: where to look for seams
     setIfChanged(canvasState_, formatCanvas(canvas));  // and places the matte on this (cvt1.07)
-    setIfChanged(roiInfo_, useRoi ? "Crop " + std::to_string(roi.box.w) + "x" + std::to_string(roi.box.h)
+    setIfChanged(roiInfo_, useRoi ? "Crop " + std::to_string(roi.box.w) + "x" + std::to_string(roi.box.h) +
+                                        (kScale > 1 ? " at " + std::to_string(kScale) + "x" : std::string())
                                   : std::string("None (alpha opaque)"));
     markPending(root, keys, getpid());
     // job.py needs numpy: the system python3 has it on Rocky 9 but not on macOS, where the job
@@ -2422,6 +2613,10 @@ class AlphaGenEffect : public OFX::ImageEffect {
   OFX::ChoiceParam* merge_;
   OFX::IntParam* roiMargin_;
   OFX::BooleanParam* roiMask_;
+  OFX::BooleanParam* roiGuide_;  // cvt1.63
+  OFX::IntParam* roiGuideGrow_;  // cvt1.64
+  OFX::ChoiceParam* cropScale_ = nullptr;  // cvt1.65
+  OFX::Clip* exclude_ = nullptr;  // cvt1.64
   OFX::BooleanParam* roiLimit_;
   OFX::StringParam* roiState_;
   OFX::StringParam* roiInfo_;
@@ -2465,6 +2660,9 @@ class AlphaGenEffect : public OFX::ImageEffect {
   OFX::IntParam* firstFrame_;        // cvt1.35
   OFX::IntParam* lastFrame_;         // cvt1.35
   OFX::DoubleParam* whiteClip_;      // cvt1.26
+  OFX::IntParam* erode_;             // cvt1.59
+  OFX::IntParam* edgeBlend_;         // cvt1.61 (Edge Fade)
+  OFX::IntParam* edgeBlur_;          // cvt1.62
   OFX::StringParam* seams_;  // cvt1.20
   double stagingBase_ = 0.0;  // CVT Resolve port: progress bar share already used by the ROI scan
   std::chrono::steady_clock::time_point stagingT0_;
@@ -2582,6 +2780,18 @@ class AlphaGenFactory : public OFX::PluginFactoryHelper<AlphaGenFactory> {
     src->addSupportedComponent(OFX::ePixelComponentRGB);
     src->setTemporalClipAccess(true);
     src->setSupportsTiles(false);
+    // cvt1.64: Occlusion Mask, an optional mask input (a Magic Mask of someone in front of the subject):
+    // taken out of the guide and cut from the matte. A mask clip in the Filter context, as
+    // openfx-misc's Mask inputs; Resolve's Color page has no extra inputs.
+    OFX::ClipDescriptor* exc = desc.defineClip(kExcludeClip);
+    exc->setLabels("Occlusion Mask", "Occlusion", "Occlusion Mask");
+    exc->addSupportedComponent(OFX::ePixelComponentAlpha);
+    exc->addSupportedComponent(OFX::ePixelComponentRGBA);
+    exc->addSupportedComponent(OFX::ePixelComponentRGB);
+    exc->setTemporalClipAccess(true);
+    exc->setSupportsTiles(false);
+    exc->setOptional(true);
+    exc->setIsMask(true);
     OFX::ClipDescriptor* dst = desc.defineClip(kOfxImageEffectOutputClipName);
     dst->addSupportedComponent(OFX::ePixelComponentAlpha);
     dst->addSupportedComponent(OFX::ePixelComponentRGBA);
@@ -2662,7 +2872,12 @@ class AlphaGenFactory : public OFX::PluginFactoryHelper<AlphaGenFactory> {
                             "What the node puts out. Source + Matte Alpha: the picture untouched with "
                             "the matte in the alpha, for a Merge or a mask in Fusion. Matte: the "
                             "matte in RGB and alpha. Overlay: a preview, the whole picture with the "
-                            "matte in magenta and a solid alpha, to check it.");
+                            "matte in magenta and a solid alpha, to check it. Pixel Spread + Matte "
+                            "Alpha: as Source + Matte Alpha, with the contaminated edge pixels (the "
+                            "background showing through hair, motion blur and soft edges) replaced "
+                            "by the subject's own colour spread out from its solid part, so no "
+                            "colour or detail of the old background is carried into the new one. "
+                            "No reprocessing.");
     for (const char* c : kOutputNames) output->appendOption(c);
     output->setDefault(kOutSource);
     desc.addClipPreferencesSlaveParam(*output);
@@ -2671,7 +2886,7 @@ class AlphaGenFactory : public OFX::PluginFactoryHelper<AlphaGenFactory> {
     // cvt1.10: premultiply in the node, as Fusion's MatteControl "Post-Multiply Image" does, so
     // a Merge can take the output directly. Render-time only, no reprocessing.
     auto* postMul = labelled(desc.defineBooleanParam(kPPostMultiply), "Post-Multiply Image",
-                             "With Output = Source + Matte Alpha: multiply the picture by the "
+                             "With Output = Source or Pixel Spread + Matte Alpha: multiply the picture by the "
                              "matte (premultiplied, as Fusion's Merge expects). Off: the picture "
                              "untouched (straight). Matte and Overlay ignore it. No "
                              "reprocessing.");
@@ -2679,6 +2894,47 @@ class AlphaGenFactory : public OFX::PluginFactoryHelper<AlphaGenFactory> {
     desc.addClipPreferencesSlaveParam(*postMul);  // re-runs GetClipPreferences (premult state)
     still(postMul);
     place(*postMul, gMain);
+    // cvt1.59: how far in from the background the decontamination reaches.
+    auto* erode = labelled(desc.defineIntParam(kPErode), "Pixel Spread Erode",  // cvt1.65: was Alpha Erode
+                           "For Output = Pixel Spread + Matte Alpha only (the other outputs ignore "
+                           "it). Pixels the solid part of the matte is eroded by before its colour "
+                           "is extended out over the soft edges, replacing the contaminated edge "
+                           "pixels (no colour or detail of the old background is left in them). "
+                           "Raise it if the edge of the solid part still carries some background "
+                           "(a dark or coloured rim). The matte itself is not changed. No "
+                           "reprocessing.");
+    erode->setRange(0, 256);
+    erode->setDisplayRange(0, 32);
+    erode->setDefault(1);  // cvt1.64: was 2
+    still(erode);
+    place(*erode, gMain);
+    // cvt1.61: a gradual change from the original pixels to the extended colour (Edge Blend in 1.61).
+    auto* edgeBlend = labelled(desc.defineIntParam(kPEdgeBlend), "Pixel Spread Fade",  // cvt1.65: was Edge Fade
+                               "For Output = Pixel Spread + Matte Alpha only (the other outputs "
+                               "ignore it). Pixels over which the original picture fades into the "
+                               "extended edge colour, going in from where Pixel Spread Erode stops. The fade "
+                               "stays inside the solid part of the matte, so it brings back no detail "
+                               "of the old background. 0: a hard switch. Pixel Spread Blur can soften it "
+                               "further. No reprocessing.");
+    edgeBlend->setRange(0, 256);
+    edgeBlend->setDisplayRange(0, 32);
+    edgeBlend->setDefault(2);  // cvt1.64: was 4
+    still(edgeBlend);
+    place(*edgeBlend, gMain);
+    // cvt1.62: a blur of the decontaminated picture near the edge, the last step before the matte.
+    auto* edgeBlur = labelled(desc.defineIntParam(kPEdgeBlur), "Pixel Spread Blur",  // cvt1.65: was Edge Blur
+                              "For Output = Pixel Spread + Matte Alpha only (the other outputs "
+                              "ignore it). Blurs the picture where the extended edge colour and the "
+                              "original meet, by about this many pixels, tapering off where Pixel Spread Fade "
+                              "ends so the picture further in stays sharp. Only the subject's pixels "
+                              "are blurred together, so no detail of the old background comes back. "
+                              "Useful on soft, out-of-focus or motion-blurred subjects. 0: off. No "
+                              "reprocessing.");
+    edgeBlur->setRange(0, 128);
+    edgeBlur->setDisplayRange(0, 16);
+    edgeBlur->setDefault(0);
+    still(edgeBlur);
+    place(*edgeBlur, gMain);
     // cvt1.26: the model's decoder leaves faint noise in the matte (0.001-0.005 in the
     // background, 0.99-0.999 inside the subject); these clean it up at render time.
     auto* blackClip = labelled(desc.defineDoubleParam(kPBlackClip), "Alpha Black Clip",
@@ -2794,6 +3050,19 @@ class AlphaGenFactory : public OFX::PluginFactoryHelper<AlphaGenFactory> {
     if (!kMps) weights->setIsSecret(true);
     still(weights);
     place(*weights, gChunk);
+    // cvt1.65: scale the input-alpha crop up for the model, for small or distant subjects.
+    auto* cscale = labelled(desc.defineChoiceParam(kPCropScale), "Crop Scale",
+                            "With an input alpha (Guided ROI): scale the crop around your subject up "
+                            "2x or 3x before the model sees it, and the matte back down after, for "
+                            "more edge detail on small or distant subjects (hair, hands, gaps between "
+                            "people). Costs about as much as an HD job. A crop that would end up "
+                            "bigger than HD is scaled less (the log says so). No effect without an "
+                            "input alpha. Needs Process.");
+    for (const char* c : kCropScaleNames) cscale->appendOption(c);
+    cscale->setDefault(0);
+    cscale->setEvaluateOnChange(false);
+    still(cscale);
+    place(*cscale, gChunk);
     // cvt1.29: the old Chunk Size (with Full), so comps saved with it still load.
     auto* oldSize = labelled(desc.defineChoiceParam(kPLegacyChunkSize), "Chunk Size (old)", "");
     for (const char* c : kLegacyChunkSizeNames) oldSize->appendOption(c);
@@ -2862,11 +3131,36 @@ class AlphaGenFactory : public OFX::PluginFactoryHelper<AlphaGenFactory> {
     rlimit->setDefault(true);  // cvt1.08: on for new nodes; nothing changes without an input alpha
     still(rlimit);
     place(*rlimit, gRoi);
+    // cvt1.63: the input alpha also steers the model (the IC-LoRA guide's attention mask).
+    auto* rguide = labelled(desc.defineBooleanParam(kPRoiGuide), "Guide With Alpha",
+                            "Use the alpha coming into the node (a Magic Mask, roto or a rough "
+                            "shape) to tell the model which subject to matte. It is grown and "
+                            "softened first, so a rough mask is enough: the model still draws the "
+                            "edges, hair included, and leaves out other people and objects. Off: "
+                            "the alpha only sets the crop. No effect when the input alpha is "
+                            "solid. Needs Process again.");
+    rguide->setDefault(false);  // saved setups keep their mattes; new nodes turn it on (createInstance)
+    still(rguide);
+    place(*rguide, gRoi);
+    // cvt1.64: how far the guide reaches past the input alpha.
+    auto* rgrow = labelled(desc.defineIntParam(kPRoiGuideGrow), "Guide Grow (px)",
+                           "With Guide With Alpha: how far the guide reaches past the input alpha, "
+                           "in pixels at HD (scaled for other sizes), so hair outside a tight mask "
+                           "is still matted. Lower it when the subject is next to or behind someone "
+                           "else (the guide then reaches onto them), or connect a mask of the one in front to "
+                           "the Occlusion Mask input; raise it for wild hair. Needs "
+                           "Process again.");
+    rgrow->setRange(0, 100);
+    rgrow->setDisplayRange(0, 60);
+    rgrow->setDefault(kGuideGrowDefault);
+    still(rgrow);
+    place(*rgrow, gRoi);
     auto* rmask = labelled(desc.defineBooleanParam(kPRoiMask), "Black Out Outside Alpha",
                            "Black out the picture outside the input alpha before the model sees it, "
                            "so it cannot pick anything else. Needs Process again. The edges then "
                            "follow your mask more closely.");
     rmask->setDefault(false);
+    rmask->setIsSecret(true);  // cvt1.64: Guide With Alpha does this better; kept working for saved setups
     still(rmask);
     place(*rmask, gRoi);
     auto* rmargin = labelled(desc.defineIntParam(kPRoiMargin), "Crop Margin (px)",

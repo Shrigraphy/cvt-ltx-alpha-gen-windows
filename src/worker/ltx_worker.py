@@ -638,14 +638,27 @@ class Engine:
             alloc_start = accel.allocated_gb()
             emit("stage", i, "converting" if conv.active else "preparing")
             raw = transport.read_frames_range(args_safe(inp), start, length)
+            # cvt1.63: a 4th channel is the guide mask (Guide With Alpha: the input alpha, grown and
+            # feathered by the plugin), which steers the model's attention to that subject.
+            guide = raw[..., 3].astype(np.float32) if raw.shape[-1] == 4 else None
+            raw = raw[..., :3]
             emit("info", f"{label}: " + input_fingerprint(raw, start))  # cvt1.58
             frames = conv.apply(raw)  # (n,h,w,3) f32
             n, h, w, _ = frames.shape
             if hold > 1:  # decision 74: frame 0 once, then each frame `hold` times
                 frames = frames[padding.hold_indices(n, hold)]
+                if guide is not None:
+                    guide = guide[padding.hold_indices(n, hold)]
             padded, (top, left) = padding.pad_spatial(frames)
             padded = padding.pad_temporal(padded)
             np_, hp, wp = padded.shape[0], padded.shape[1], padded.shape[2]
+            guide_t = None
+            if guide is not None:
+                g, _ = padding.pad_spatial(guide[..., None])
+                g = padding.pad_temporal(g)[..., 0]
+                guide_t = torch.from_numpy(np.ascontiguousarray(g))[None, None].to(accel.device, torch.float32)
+                emit("info", f"{label}: guided by the input alpha (mask covers {float(guide_t.mean()) * 100:.1f}% "
+                             f"of the frame)")
             frames_t = torch.from_numpy(np.ascontiguousarray(padded))
             if self.frames_on_gpu:
                 frames_t = frames_t.to(accel.device)
@@ -678,7 +691,8 @@ class Engine:
                 decoded, _, _ = self.pipeline.stream_chunks(
                     prompt="", seed=seed, height=hp * 2, width=wp * 2, num_frames=np_, frame_rate=FRAME_RATE,
                     images=[], video_conditioning=[(MEMORY_REF, 1.0)], skip_stage_2=True,
-                    vae_dtype=torch.bfloat16 if self.fp16 else None)
+                    vae_dtype=torch.bfloat16 if self.fp16 else None,
+                    conditioning_attention_mask=guide_t)  # cvt1.63: None = unguided, as before
                 video = torch.cat([c.video.to("cpu") for c in decoded], dim=0)  # (F,H,W,C) bf16 in [0,1]
             MemoryFrameSource.frames = None
             v = video.float()
