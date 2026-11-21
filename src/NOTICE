@@ -15,3 +15,8 @@ under the LTX-2.x Community License.
 DaVinci Resolve and Fusion Studio port (Apple Silicon): Chadwick, Creative Video Tips
 (creativevideotips.com), 2026, under the same Mozilla Public License 2.0. The changes from the
 Flame version are listed in CVT_PORT.md.
+
+Windows/CUDA port: tobkum, https://github.com/creativevideotips/cvt-ltx-alpha-gen/pull/1.
+The Shrigraphy fork integrates that port with CVT v1.65 under the same license.
+Windows binaries bundle uv, dual-licensed under MIT or Apache-2.0:
+https://github.com/astral-sh/uv.

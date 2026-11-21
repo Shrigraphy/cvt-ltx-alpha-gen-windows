@@ -1,31 +1,33 @@
 # LTX Alpha Gen for DaVinci Resolve
 
-**Local, stable AI roto for DaVinci Resolve. Free, on your Mac.** An OFX plugin
+**Local AI roto for DaVinci Resolve.** An OFX plugin
 for DaVinci Resolve and Fusion Studio that makes an alpha matte for a clip with
 Lightricks' LTX-2.5 Alpha Gen model.
 
 From [Creative Video Tips](https://creativevideotips.com), ported by Chadwick
 from [LTX Alpha Gen OFX for Flame](https://github.com/flamelogik/Flame_LTXAlphaGen_OFX)
 by Jan Klier, maintained by [Logik.tv](https://logik.tv). This is an independent
-port, not made or endorsed by Lightricks or Blackmagic Design.
+port, not made or endorsed by Lightricks or Blackmagic Design. This Windows fork
+combines CVT v1.65 with [tobkum's Windows/CUDA port](https://github.com/creativevideotips/cvt-ltx-alpha-gen/pull/1).
 
 ## Download
 
-### [Download the installer: LTXAlphaGen-1.65.pkg](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/download/v1.65/LTXAlphaGen-1.65.pkg)
+### [Download for Windows x64 (NVIDIA)](https://github.com/Shrigraphy/cvt-ltx-alpha-gen-windows/releases/download/v1.65-windows.1/LTXAlphaGen-1.65-Windows-x64.zip)
 
-### [Download the guide (PDF)](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/download/v1.65/LTX_Alpha_Gen_Guide.pdf)
+See [Windows install and setup](#windows-nvidia). The package is a prerelease.
 
-These links download the files straight away. You won't find the installer in the list of code files above: GitHub keeps it on the [Releases page](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/latest), under **Assets**. The installer is only the plugin, and you also need to [download the models](#setup-download-the-models).
+### [Official macOS installer](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/download/v1.65/LTXAlphaGen-1.65.pkg)
+
+### [Creative Video Tips guide (PDF)](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/download/v1.65/LTX_Alpha_Gen_Guide.pdf)
 
 ![The first, middle and last matte of a shot of a circular saw and an arm](fusion_studio_first_mattes.png)
 
 
-## Is it for you?
+## Is it for you? (macOS)
 
 - **Try Magic Mask first.** Resolve's Magic Mask is far faster, so use it first.
   When its matte isn't good enough, use LTX Alpha Gen for the more precise work.
-- **Mac with Apple Silicon only.** It runs the model on the Mac's GPU. There is
-  no Windows, Linux or NVIDIA version.
+- **Mac with Apple Silicon.** For Windows requirements, see [Windows](#windows-nvidia).
 - **macOS 15 (Sequoia) or later.** The plugin is built for macOS 15, and the installer
   will not install on an older macOS.
 - **Tested with Resolve Studio and Fusion Studio.** It has not yet been tested in the
@@ -362,9 +364,75 @@ you have used the plugin.
 - `~/.cache/ltx-alphagen` (and your Cache Folder, if you changed it)
 - `~/.config/ltx-alphagen`
 
+## Windows (NVIDIA)
+
+This prerelease brings CVT v1.65 to Windows 10 and 11 (64-bit) with NVIDIA CUDA.
+It includes Guided ROI, the Occlusion Mask input, Crop Scale and Pixel Spread.
+
+1. Download and extract the [Windows ZIP](https://github.com/Shrigraphy/cvt-ltx-alpha-gen-windows/releases/download/v1.65-windows.1/LTXAlphaGen-1.65-Windows-x64.zip).
+2. Quit Resolve and Fusion Studio. From PowerShell in the extracted folder, run
+   `powershell -ExecutionPolicy Bypass -File .\install.ps1` and approve the administrator prompt.
+3. In Resolve's Fusion page, add **Effects > OpenFX > Creative Video Tips > LTX Alpha Gen**.
+4. Follow [Setup](#setup-download-the-models) from the node's **Setup** section to accept
+   the model terms, create a Hugging Face read token and download the weights. The Apple
+   Command Line Tools step applies to macOS. Setup installs Python on Windows.
+
+The v1.65 Windows build passed the unit and fast OFX system tests with a dummy model worker.
+Real-model inference on this v1.65 integration remains unverified.
+
+The [earlier Windows port](https://github.com/creativevideotips/cvt-ltx-alpha-gen/pull/1)
+completed Setup and generated real-model mattes in Resolve Studio 21.2 on Windows 11
+with an RTX 4090 24 GB and 94 GB of RAM. It ran in fp8 with weights streamed from system
+memory. On a synthetic clip with a reference matte, the mean error was 0.0058.
+
+| Job (fp8, weights in system memory) | Time | Peak GPU memory |
+|---|---|---|
+| 120 HD frames in Resolve, 6 chunks of 33 | about 11.5 min (about 110 s a chunk) | 11.1 GB |
+| 17 HD frames in Resolve, 1 chunk | 78 s | 7.6 GB |
+| 17 frames at 768×512, outside Resolve | 50 s | 5.5 GB |
+
+Windows results for bf16, GPU-resident or disk-streamed weights, shots longer than 33 frames
+per chunk, and real footage are still pending. Windows Fusion Studio and Resolve's Edit and
+Color pages also remain unverified. Use **Collect Logs** to save a support ZIP.
+
+**What you need**
+
+- An NVIDIA card with a driver that supports the bundled runtime's CUDA 13.2 build.
+  The earlier port's RTX 4090 test is the real-model reference. Cards with less VRAM,
+  including 10 GB cards, may require a smaller input or guided crop.
+- GPU memory: the model's weights are about 42 GB (bf16) or about half that (fp8), so they only
+  fit the largest cards. On smaller cards the plugin keeps them in system memory and sends them
+  to the GPU a layer at a time: that is how it was tested on a 24 GB card. It needs about
+  26 GB of free system memory in fp8 or 48 GB in bf16; with less, they are read from disk, slowly.
+- About 85 GB of disk space for the models and the runtime.
+- Nothing else: no Python and no compiler. Setup brings its own Python.
+
+**What is different from the Mac**
+
+- **Install:** `.\install.ps1` copies the plugin to
+  `C:\Program Files\Common Files\OFX\Plugins\LTXAlphaGen.ofx.bundle` (Windows asks for
+  administrator rights).
+- **Setup:** there is no Command Line Tools step. The Choose buttons open Explorer's folder picker.
+  **Link Existing Models** needs Windows' Developer Mode for a real link; without it Setup makes
+  a hard link when both folders are on one drive, and copies otherwise. There is no extra fp16
+  copy of the model.
+- **Performance** (a folded section, Windows only):
+
+  | Control | What it does |
+  |---|---|
+  | Precision | **bf16**: reference quality. **fp8**: the weights take about half the memory, with a slightly different matte. New nodes start on fp8 when bf16 does not fit the GPU. Needs Process. |
+  | Model Loading | Where the weights are kept. **Auto** (default): on the GPU when they fit its free memory, otherwise in system memory, otherwise read from disk. **On the GPU**, **In System Memory** and **From Disk** force one. The matte is the same. Needs Process. |
+
+- **Chunk Size:** Auto can use up to 145 frames at HD when the GPU has the memory (the Mac's size
+  limit does not apply).
+- **Folders:** the same names, in your user folder: `%USERPROFILE%\LTX-2.5` (models),
+  `%USERPROFILE%\.cache\ltx-alphagen` (mattes and the log, `logs\ltx-alphagen.log`),
+  `%USERPROFILE%\.config\ltx-alphagen` (settings). Collect Logs writes a `.zip` to your user
+  folder. To uninstall, delete those and the plugin folder above.
+
 ## Build from source
 
-You need the Xcode Command Line Tools and cmake (`brew install cmake`). Quit Resolve first.
+**Mac:** you need the Xcode Command Line Tools and cmake (`brew install cmake`). Quit Resolve first.
 
 ```bash
 ./build.sh --systest
@@ -373,6 +441,21 @@ You need the Xcode Command Line Tools and cmake (`brew install cmake`). Quit Res
 ```bash
 ./install.sh
 ```
+
+**Windows:** you need Visual Studio 2022 or its Build Tools with "Desktop development with C++",
+[CMake](https://cmake.org/download/), and Python 3.10 or later (or uv) on PATH. Quit Resolve first.
+In PowerShell:
+
+```powershell
+.\build.ps1 -Systest
+```
+
+```powershell
+.\install.ps1
+```
+
+If PowerShell says scripts are disabled, run them as
+`powershell -ExecutionPolicy Bypass -File .\build.ps1 -Systest`.
 
 The source is in `src/`, and every change from the Flame version is listed in
 `src/CVT_PORT.md`.
@@ -387,5 +470,6 @@ The source is in `src/`, and every change from the Flame version is listed in
   Community License, which is free below USD 10M annual revenue. Above that, a paid
   Lightricks licence is required.
 - **The port:** Chadwick, [Creative Video Tips](https://creativevideotips.com).
+- **Windows/CUDA port:** [tobkum](https://github.com/tobkum), with the v1.65 integration in this fork.
 
 DaVinci Resolve and Fusion Studio are trademarks of Blackmagic Design.

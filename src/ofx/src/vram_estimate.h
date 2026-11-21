@@ -40,6 +40,18 @@
 //   UHD 17 -> 45.2. The floor is the highest peak measured without audio (HD 33f took 42.9 GB in
 //   worker_smoke), so small clips are over-estimated (768x432 17f: 44.1 vs 27.4 GB). The M1 Ultra
 //   fit drops by the same 7.0 GB (not measured on an M1).
+// Windows port (streamed = true): the transformer's weights are not on the GPU but sent to it a
+// layer at a time (LTX-2's OffloadMode cpu / disk; its documentation gives about 5 GB of GPU
+// memory for that buffer). What must fit is then the larger of the denoising (buffer + the
+// per-frame term above) and the reference encode, which the resident-transformer fit above
+// measured apart from the transformer (1.56 GB + 0.1088 GB * Mpx * frames + 0.7 GB context):
+//   need = max(6.0 + 0.0718 * Mpx * frames, 2.26 + 0.1088 * Mpx * frames)
+//          + 0.70 GB * max(0, Mpx - 2.09) + 1 GB; HD 33 -> 12.0, HD 73 -> 19.9, HD 145 -> 36.2.
+// The same for bf16 and fp8: the weights' size then counts against system memory, not the GPU.
+// Built from those two fits. First streamed runs (RTX 4090 24 GB, Windows 11, torch 2.13.0+cu132,
+// fp8, offload cpu, 2026-11-11), peak reserved against this estimate: HD 33f 11.1 GB (11.9),
+// HD 17f 7.6 (9.6), 768x512 17f 5.5 (7.0). Cautious by 1-2 GB; bf16, offload disk and longer
+// chunks are not measured.
 #pragma once
 
 namespace ltxag {
@@ -72,6 +84,7 @@ constexpr double kMpsMaxMpxFrames = 170.0;
 // branch (cvt1.50); Int8 (cvt1.53) 8-bit weights, always video-only.
 enum class Weights { Full16 = 0, VideoOnly16 = 1, Int8 = 2 };
 VramNeed estimateVramNeed(bool fp8, int width, int height, int framesInLargestChunk,
-                          bool residentTransformer, int mps = 0, Weights weights = Weights::Full16);
+                          bool residentTransformer, int mps = 0, Weights weights = Weights::Full16,
+                          bool streamed = false);
 
 }  // namespace ltxag

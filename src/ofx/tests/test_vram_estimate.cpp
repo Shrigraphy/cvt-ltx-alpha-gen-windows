@@ -12,8 +12,8 @@ static int failures = 0;
 static constexpr double kNoAudio = 7.0;
 
 static void covers(const char* what, bool fp8, int w, int h, int f, bool resident, double measured,
-                   double maxOver, int mps = 0, Weights wts = Weights::Full16) {
-  const VramNeed n = estimateVramNeed(fp8, w, h, f, resident, mps, wts);
+                   double maxOver, int mps = 0, Weights wts = Weights::Full16, bool streamed = false) {
+  const VramNeed n = estimateVramNeed(fp8, w, h, f, resident, mps, wts, streamed);
   const bool ok = n.gb >= measured && n.gb - measured <= maxOver;
   std::printf("%s %-34s est %5.1f GB vs measured %5.1f GB (model %dx%dx%d)\n", ok ? "ok  " : "FAIL", what, n.gb,
               measured, n.modelW, n.modelH, n.modelFrames);
@@ -36,6 +36,10 @@ int main() {
   covers("A/B HD 145 fp8 resident, chunk 2", true, 1920, 1080, 145, true, 56.2 + 0.7, 4.0);
   covers("test 2: 720p 57 bf16 resident reused", false, 1280, 720, 50, true, 44.2, 4.0);
   covers("test 2: 720p 57 fp8 resident fresh", true, 1280, 720, 50, true, 28.0, 4.0);
+  // Windows port's RTX 4090 measurements with fp8 weights streamed from RAM.
+  covers("CUDA streamed 768x512 17 fp8", true, 768, 512, 17, false, 5.5, 2.0, 0, Weights::Full16, true);
+  covers("CUDA streamed HD 17 fp8", true, 1920, 1080, 17, false, 7.6, 2.2, 0, Weights::Full16, true);
+  covers("CUDA streamed HD 33 fp8", true, 1920, 1080, 33, false, 11.1, 2.0, 0, Weights::Full16, true);
   // Apple Silicon, M1 Ultra, our worker (decision 65): lowest free working set.
   covers("mps 720p 49 bf16", false, 1280, 720, 49, false, 52.3 - kNoAudio, 4.0, 1, Weights::VideoOnly16);
   covers("mps HD 33 bf16", false, 1920, 1080, 33, false, 60.4 - kNoAudio, 4.0, 1, Weights::VideoOnly16);

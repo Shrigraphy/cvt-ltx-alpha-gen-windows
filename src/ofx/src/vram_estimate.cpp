@@ -52,10 +52,11 @@ constexpr double kMps8TiledBase = 13.0, kMps8TiledPerMpxFrame = 0.137;
 // audio weights (allocated barely moves; a sync per tensor while loading changed nothing). Small chunks
 // sit on the load's peak, hence the floor.
 constexpr double kMpsFullFloor = 40.6, kMpsFullBase = 36.8, kMpsFullPerMpxFrame = 0.086;
+constexpr double kStreamBase = 6.0;  // Windows port: weights streamed to the GPU, see the header
 }  // namespace
 
 VramNeed estimateVramNeed(bool fp8, int width, int height, int frames, bool residentTransformer, int mps,
-                          Weights weights) {
+                          Weights weights, bool streamed) {
   const bool int8 = weights == Weights::Int8;
   VramNeed n{};
   n.modelW = (std::max(width, 1) + 31) / 32 * 32;
@@ -80,6 +81,12 @@ VramNeed estimateVramNeed(bool fp8, int width, int height, int frames, bool resi
     n.gb = kMpsBase + kMpsPerMpxFrame * mpx * n.modelFrames + kMargin;  // the full model (cvt1.56 again)
     if (weights != Weights::Full16) n.gb -= kMpsNoAudio;  // cvt1.51 (not measured on an M1)
     if (int8) n.gb -= kMpsInt8Saving;  // cvt1.53 (not measured on an M1)
+    return n;
+  }
+  if (streamed) {  // Windows port
+    n.gb = std::max(kStreamBase + kPerMpxFrame * mpx * n.modelFrames,
+                    kEncodeBase + kContext + kEncodePerMpxFrame * mpx * n.modelFrames) +
+           kPerMpxAboveHD * std::max(0.0, mpx - kHDMpx) + kMargin;
     return n;
   }
   n.gb = kBaseFp8 + (fp8 ? 0.0 : kBf16Extra) + kPerMpxFrame * mpx * n.modelFrames +
