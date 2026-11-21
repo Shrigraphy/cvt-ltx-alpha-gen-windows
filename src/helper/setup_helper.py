@@ -614,7 +614,14 @@ def main() -> int:
         if not oslayer.WINDOWS:
             log.info(f"C compiler (Command Line Tools): {cc}")
         os.makedirs(model_dir, exist_ok=True)
-        py = a.ltx_python if a.skip_runtime else install_runtime(man, os.path.join(model_dir, "runtime"), prog)
+        runtime_dir = os.path.join(model_dir, "runtime")
+        runtime_location = os.path.join(model_dir, "runtime-location.txt")
+        if oslayer.WINDOWS and os.path.isfile(runtime_location) and not a.skip_runtime:
+            with open(runtime_location, encoding="utf-8-sig") as source:
+                runtime_dir = source.read().strip()
+            if not os.path.isabs(runtime_dir) or not os.path.isdir(runtime_dir):
+                raise SetupError("The configured LTX runtime folder is unavailable: " + runtime_dir)
+        py = a.ltx_python if a.skip_runtime else install_runtime(man, runtime_dir, prog)
         summary = gather_models(man, model_dir, a.existing, token, prog, link=a.link)
         # Decision 68: the fp16 copy is for Macs without fast bf16; an NVIDIA card has bf16 and fp8.
         fp16_ready = make_fp16_copy(py, man, model_dir, prog) if sys.platform == "darwin" else None

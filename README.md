@@ -369,7 +369,7 @@ you have used the plugin.
 This prerelease brings CVT v1.65 to Windows 10 and 11 (64-bit) with NVIDIA CUDA.
 It includes Guided ROI, the Occlusion Mask input, Crop Scale and Pixel Spread.
 
-1. Download and extract the [Windows ZIP](https://github.com/Shrigraphy/cvt-ltx-alpha-gen-windows/releases/download/v1.65-windows.1/LTXAlphaGen-1.65-Windows-x64.zip).
+1. Download and extract the [Windows ZIP](https://github.com/Shrigraphy/cvt-ltx-alpha-gen-windows/releases/download/v1.65-windows.2/LTXAlphaGen-1.65-Windows-x64.zip).
 2. Quit Resolve and Fusion Studio. From PowerShell in the extracted folder, run
    `powershell -ExecutionPolicy Bypass -File .\install.ps1` and approve the administrator prompt.
 3. In Resolve's Fusion page, add **Effects > OpenFX > Creative Video Tips > LTX Alpha Gen**.
@@ -378,7 +378,11 @@ It includes Guided ROI, the Occlusion Mask input, Crop Scale and Pixel Spread.
    Command Line Tools step applies to macOS. Setup installs Python on Windows.
 
 The v1.65 Windows build passed the unit and fast OFX system tests with a dummy model worker.
-Real-model inference on this v1.65 integration remains unverified.
+Prerelease 2 completed real-model Setup on Windows 11 with 32 GB RAM and an RTX 3080 10 GB.
+In Resolve Studio 21.1.2, a 384×256, 17-frame job with FP8 and **From Disk** cleared the
+default memory check and completed five of eight denoising passes on the RTX 3080.
+The job was cancelled about an hour after it started, during the sixth pass. It wrote no
+mattes. The checkpoints were on an external mechanical hard drive.
 
 The [earlier Windows port](https://github.com/creativevideotips/cvt-ltx-alpha-gen/pull/1)
 completed Setup and generated real-model mattes in Resolve Studio 21.2 on Windows 11
@@ -391,9 +395,8 @@ memory. On a synthetic clip with a reference matte, the mean error was 0.0058.
 | 17 HD frames in Resolve, 1 chunk | 78 s | 7.6 GB |
 | 17 frames at 768×512, outside Resolve | 50 s | 5.5 GB |
 
-Windows results for bf16, GPU-resident or disk-streamed weights, shots longer than 33 frames
-per chunk, and real footage are still pending. Windows Fusion Studio and Resolve's Edit and
-Color pages also remain unverified. Use **Collect Logs** to save a support ZIP.
+Completed v1.65 real-model renders, Windows Fusion Studio, and Resolve's Edit and Color
+pages remain unverified. Use **Collect Logs** to save a support ZIP.
 
 **What you need**
 
@@ -415,7 +418,9 @@ Color pages also remain unverified. Use **Collect Logs** to save a support ZIP.
 - **Setup:** there is no Command Line Tools step. The Choose buttons open Explorer's folder picker.
   **Link Existing Models** needs Windows' Developer Mode for a real link; without it Setup makes
   a hard link when both folders are on one drive, and copies otherwise. There is no extra fp16
-  copy of the model.
+  copy of the model. To keep the Python runtime on a separate NTFS drive, put the absolute path
+  of an existing directory in `runtime-location.txt` inside the selected Model Folder before
+  running Setup.
 - **Performance** (a folded section, Windows only):
 
   | Control | What it does |

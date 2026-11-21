@@ -341,11 +341,17 @@ def build_embeddings(path: str, transformer: str, text_encoder: str, video_vae: 
 
     from ltx_pipelines.utils.blocks import PromptEncoder
     from ltx_pipelines.utils.model_paths import ModelPaths
+    from ltx_pipelines.utils.types import OffloadMode
 
     t0 = time.time()
     model_paths = ModelPaths.from_split(transformer_path=transformer, text_encoder_path=text_encoder,
                                         video_vae_path=video_vae)
-    encoder = PromptEncoder(model_paths, torch.bfloat16, Accel(torch).device)
+    accel = Accel(torch)
+    offload = OffloadMode.NONE
+    if accel.kind == "cuda" and accel.free_gb() < os.path.getsize(text_encoder) / 2**30 + 2:
+        offload = OffloadMode.DISK
+        print("info Gemma weights will stream from disk for prompt setup", flush=True)
+    encoder = PromptEncoder(model_paths, torch.bfloat16, accel.device, offload_mode=offload)
     with torch.inference_mode():
         (out,) = encoder([""])
     tensors = {"video_encoding": out.video_encoding, "attention_mask": out.attention_mask}
@@ -932,6 +938,11 @@ class Server:
 
 
 def main() -> int:
+    if oslayer.WINDOWS:
+        from ltxag_worker import windows_safetensors
+
+        windows_safetensors.install()
+
     if "--fp16-probe" in sys.argv:  # decision 68: Setup asks whether fp16 is faster here
         import torch
 
